@@ -1,4 +1,4 @@
-﻿using UnityEngine;
+using UnityEngine;
 using UnityEditor;
 using System.Diagnostics;
 using System.Collections.Generic;
@@ -33,9 +33,9 @@ public static class DiversionStatusOverlay
 	{
 		// Use Unity built-in icons for status overlays
 		statusIcons["A"] = EditorGUIUtility.FindTexture("PackageBadgeNew");
-		statusIcons["M"] = EditorGUIUtility.FindTexture("Collab.FileUpdated");
+		statusIcons["M"] = EditorGUIUtility.FindTexture("d_CollabEdit Icon");
 		statusIcons["D"] = EditorGUIUtility.FindTexture("Collab.FileDeleted");
-		statusIcons["C"] = EditorGUIUtility.FindTexture("Collab.FileConflict");
+		statusIcons["C"] = EditorGUIUtility.FindTexture("d_CollabConflict Icon");
 		statusIcons["U"] = EditorGUIUtility.FindTexture("Collab");
 
 		// Add icon for moved/renamed files
