@@ -21,6 +21,15 @@ public static class DiversionStatusOverlay
 	const string DiversionRefreshDelayKey = "DiversionOverlay.RefreshDelay"; // EditorPrefs key for refresh delay
 	static float defaultRefreshDelay = 10.0f; // Default refresh delay in seconds
 
+	const string ShowRootFolderIconKey = "DiversionOverlay.ShowRootFolderIcon"; // EditorPrefs key for showing icon on Assets folder
+	static bool defaultShowRootFolderIcon = false; // Default state for showing icon on Assets folder
+
+	private static Process statusProcess;
+	private static System.Threading.Thread statusProcessThread; // Keep track of the thread if needed, though not strictly used here
+	private static string statusProcessOutput = "";
+	private static string statusProcessError = "";
+	private static bool statusProcessCompleted = false;
+
 	static DiversionStatusOverlay()
 	{
 		LoadIcons();
@@ -75,7 +84,9 @@ public static class DiversionStatusOverlay
 		// Check if it's a folder and has a status in folderStatus
 		if (AssetDatabase.IsValidFolder(path))
 		{
-			if (folderStatus.ContainsKey(path))
+			bool showRootIcon = EditorPrefs.GetBool(ShowRootFolderIconKey, defaultShowRootFolderIcon);
+			// Display folder icon if it has status and either it's not the root or showing root is enabled
+			if (folderStatus.ContainsKey(path) && (path != "Assets" || showRootIcon))
 			{
 				// Use the specific folder icon
 				iconToDraw = EditorGUIUtility.FindTexture("d_CollabChanges Icon");
@@ -115,13 +126,20 @@ public static class DiversionStatusOverlay
 
 	static void UpdateStatus()
 	{
+		// Prevent starting a new status process if one is already running		
+		if (statusProcess != null && !statusProcess.HasExited)
+		{
+			//UnityEngine.Debug.Log("Diversion Status Overlay: Status update already in progress.");
+			return;
+		}
+
 		fileStatus.Clear();
 		folderStatus.Clear();
 
 		ProcessStartInfo psi = new()
 		{
 			FileName = DiversionCLIPath,
-			Arguments = "status --porcelain",
+			Arguments = "status --wait --porcelain", // Added --wait to wait for sync
 			RedirectStandardOutput = true,
 			RedirectStandardError = true,
 			UseShellExecute = false,
@@ -131,26 +149,32 @@ public static class DiversionStatusOverlay
 
 		try
 		{
-			using Process process = Process.Start(psi);
-			using StreamReader outputReader = process.StandardOutput;
-			using StreamReader errorReader = process.StandardError;
+			statusProcessOutput = "";
+			statusProcessError = "";
+			statusProcessCompleted = false;
 
-			string output = outputReader.ReadToEnd();
-			string error = errorReader.ReadToEnd();
+			statusProcess = new Process();
+			statusProcess.StartInfo = psi;
+			statusProcess.EnableRaisingEvents = true; // Essential for Exited event
+			statusProcess.Exited += (sender, args) => { statusProcessCompleted = true; };
 
-			process.WaitForExit();
+			statusProcess.Start();
 
-			if (!string.IsNullOrEmpty(error))
-			{
-				UnityEngine.Debug.LogWarning($"Diversion CLI Error: {error}");
-			}
+			// Start reading output asynchronously
+			statusProcess.BeginOutputReadLine();
+			statusProcess.BeginErrorReadLine();
 
-			ParseDiversionOutput(output);
-			PropagateStatusToFolders();
+			statusProcess.OutputDataReceived += (sender, args) => { if (!string.IsNullOrEmpty(args.Data)) statusProcessOutput += args.Data + "\n"; };
+			statusProcess.ErrorDataReceived += (sender, args) => { if (!string.IsNullOrEmpty(args.Data)) statusProcessError += args.Data + "\n"; };
+
+			//UnityEngine.Debug.Log("Diversion Status Overlay: Status update process started in background.");
 		}
 		catch (System.Exception ex)
 		{
-			UnityEngine.Debug.LogWarning("Failed to run Diversion CLI: " + ex.Message);
+			// UnityEngine.Debug.LogWarning("Failed to run Diversion CLI: " + ex.Message);
+			UnityEngine.Debug.LogError("Failed to start Diversion CLI status process: " + ex.Message);
+			statusProcess = null; // Ensure process is null if starting failed
+			statusProcessCompleted = true; // Mark as completed to avoid infinite waiting if starting failed
 		}
 	}
 
@@ -361,8 +385,43 @@ public static class DiversionStatusOverlay
 		if (refreshScheduled && EditorApplication.timeSinceStartup >= nextRefreshTime)
 		{
 			refreshScheduled = false;
-			UpdateStatus();
-			EditorApplication.RepaintProjectWindow();
+			UpdateStatus(); // This now starts the process asynchronously
+			EditorApplication.RepaintProjectWindow(); // Repaint to clear old icons while waiting
+		}
+
+		// Check if the background status process has completed
+		if (statusProcessCompleted && statusProcess != null)
+		{
+			// Process the results on the main thread
+			try
+			{
+				//UnityEngine.Debug.Log("Diversion Status Overlay: Background status process completed. Processing results.");
+
+				if (!string.IsNullOrEmpty(statusProcessError))
+				{
+					UnityEngine.Debug.LogWarning($"Diversion CLI Error (Background):\n{statusProcessError}");
+				}
+
+				ParseDiversionOutput(statusProcessOutput);
+				PropagateStatusToFolders();
+
+				EditorApplication.RepaintProjectWindow(); // Repaint with updated icons
+
+				UnityEngine.Debug.Log($"Diversion Status Overlay: Status update complete. Parsed {fileStatus.Count} file statuses.");
+			}
+			catch (System.Exception ex)
+			{
+				UnityEngine.Debug.LogError("Diversion Status Overlay: Error processing background status results: " + ex.Message);
+			}
+			finally
+			{
+				// Clean up the process
+				statusProcess.Dispose();
+				statusProcess = null;
+				statusProcessOutput = "";
+				statusProcessError = "";
+				statusProcessCompleted = false;
+			}
 		}
 	}
 
@@ -391,12 +450,16 @@ public static class DiversionStatusOverlay
 		const string DiversionRefreshDelayKey = "DiversionOverlay.RefreshDelay"; // Must match the key in DiversionStatusOverlay
 		static float refreshDelay;
 
+		const string ShowRootFolderIconKey = "DiversionOverlay.ShowRootFolderIcon"; // Must match the key in DiversionStatusOverlay
+		static bool showRootFolderIcon;
+
 		// Constructor
 		public DiversionOverlaySettingsProvider(string path, SettingsScope scope = SettingsScope.Project)
 			: base(path, scope)
 		{
 			// Load the setting when the provider is created
 			refreshDelay = EditorPrefs.GetFloat(DiversionRefreshDelayKey, DiversionStatusOverlay.defaultRefreshDelay);
+			showRootFolderIcon = EditorPrefs.GetBool(ShowRootFolderIconKey, DiversionStatusOverlay.defaultShowRootFolderIcon);
 		}
 
 		// Method to create the SettingsProvider instance
@@ -421,12 +484,18 @@ public static class DiversionStatusOverlay
 			// Validate input to be non-negative
 			if (refreshDelay < 0) refreshDelay = 0;
 
+			EditorGUILayout.Space(); // Add some spacing
+
+			// Display toggle for root folder icon
+			showRootFolderIcon = EditorGUILayout.Toggle("Show Icon on Assets Folder", showRootFolderIcon);
+
 			// Save the setting when the GUI changes
 			if (GUI.changed)
 			{
 				EditorPrefs.SetFloat(DiversionRefreshDelayKey, refreshDelay);
+				EditorPrefs.SetBool(ShowRootFolderIconKey, showRootFolderIcon);
 				// Optionally, immediately schedule a refresh with the new delay
-				DiversionStatusOverlay.ScheduleRefresh();
+				ScheduleRefresh();
 			}
 		}
 	}
