@@ -24,6 +24,7 @@ public static class DiversionStatusOverlay
 	public const string DiversionRefreshDelayKey = "DiversionOverlay.RefreshDelay";
 	public const string DiversionMaxFilesKey = "DiversionOverlay.MaxFiles";
 	public const string DiversionAccessTokenLastRefreshKey = "DiversionOverlay.AccessTokenLastRefresh";
+	public const string DiversionDebugLogsKey = "DiversionOverlay.DebugLogs";
 	private const double AccessTokenRefreshIntervalSeconds = 59 * 60; // 59 minutes
 
 	private static bool pendingRefresh = false;
@@ -114,7 +115,7 @@ public static class DiversionStatusOverlay
 
 		if (string.IsNullOrEmpty(accessToken) || string.IsNullOrEmpty(repoId) || string.IsNullOrEmpty(workspaceId))
 		{
-			Debug.LogWarning("Diversion Overlay: Missing access token, repo ID, or workspace ID.");
+			if (DiversionStatusOverlay.DebugLogsEnabled) Debug.LogWarning("Diversion Overlay: Missing access token, repo ID, or workspace ID.");
 			return;
 		}
 
@@ -128,7 +129,7 @@ public static class DiversionStatusOverlay
 		while (more)
 		{
 			string apiUrl = $"https://api.diversion.dev/v0/repos/{repoId}/workspaces/{workspaceId}/status?detail_items=true&recurse=true&limit={limit}&skip={skip}";
-			Debug.Log($"Diversion Overlay: Fetching status from API (skip={skip})...");
+			if (DiversionStatusOverlay.DebugLogsEnabled) Debug.Log($"Diversion Overlay: Fetching status from API (skip={skip})...");
 			using (UnityWebRequest webRequest = UnityWebRequest.Get(apiUrl))
 			{
 				webRequest.SetRequestHeader("Authorization", $"Bearer {accessToken}");
@@ -193,7 +194,7 @@ public static class DiversionStatusOverlay
 		{
 			string path = item["path"]?.Value<string>();
 			string prevPath = item["prev_path"]?.Value<string>();
-			string status = string.IsNullOrEmpty(prevPath) ? "modified" : "moved";
+			string status = (!string.IsNullOrEmpty(prevPath) && prevPath != path) ? "moved" : "modified";
 			if (!string.IsNullOrEmpty(path) && path.StartsWith("Assets"))
 				fileStatus[path] = status;
 		}
@@ -204,7 +205,7 @@ public static class DiversionStatusOverlay
 			if (!string.IsNullOrEmpty(path) && path.StartsWith("Assets"))
 				fileStatus[path] = "deleted";
 		}
-		Debug.Log($"Diversion Overlay: Parsed {fileStatus.Count} file statuses from API.");
+		if (DiversionStatusOverlay.DebugLogsEnabled) Debug.Log($"Diversion Overlay: Parsed {fileStatus.Count} file statuses from API.");
 		PropagateStatusToFolders();
 	}
 
@@ -271,6 +272,7 @@ public static class DiversionStatusOverlay
 	[MenuItem("Tools/Diversion/Refresh Status")]
 	public static void ManualRefreshStatus()
 	{
+		Debug.Log("Diversion Overlay: Manual status refresh triggered.");
 		UpdateStatusAsync();
 		EditorApplication.RepaintProjectWindow();
 	}
@@ -286,7 +288,7 @@ public static class DiversionStatusOverlay
 		}
 		if (string.IsNullOrEmpty(diversionCLIPath) || !System.IO.File.Exists(diversionCLIPath))
 		{
-			Debug.LogError("Diversion Overlay: Could not find Diversion CLI (dv). Please set the path in Project Settings.");
+			if (DiversionStatusOverlay.DebugLogsEnabled) Debug.LogWarning("Diversion Overlay: Could not find Diversion CLI (dv). Please set the path in Project Settings.");
 			return;
 		}
 		var psi = new System.Diagnostics.ProcessStartInfo
@@ -335,11 +337,11 @@ public static class DiversionStatusOverlay
 				{
 					EditorPrefs.SetString(DiversionRepoIdKey, repoId);
 					EditorPrefs.SetString(DiversionWorkspaceIdKey, workspaceId);
-					Debug.Log($"Diversion Overlay: Auto-fetched Repo ID: {repoId}, Workspace ID: {workspaceId}");
+					if (DiversionStatusOverlay.DebugLogsEnabled) Debug.Log($"Diversion Overlay: Auto-fetched Repo ID: {repoId}, Workspace ID: {workspaceId}");
 				}
 				else
 				{
-					Debug.LogWarning("Diversion Overlay: Could not auto-detect Repo ID or Workspace ID.");
+					if (DiversionStatusOverlay.DebugLogsEnabled) Debug.LogWarning("Diversion Overlay: Could not auto-detect Repo ID or Workspace ID.");
 				}
 			}
 		}
@@ -554,24 +556,16 @@ public static class DiversionStatusOverlay
 
 		if (newFiles.Count > 0)
 		{
-			deleteNewFiles = EditorUtility.DisplayDialogComplex(
+			int result = EditorUtility.DisplayDialogComplex(
 				"Discard",
 				message,
 				"Proceed and Delete New Files",
 				"Cancel",
 				"Proceed Without Deleting New Files"
-			) == 0;
-			if (!deleteNewFiles && EditorUtility.DisplayDialogComplex(
-				"Discard",
-				message,
-				"Proceed Without Deleting New Files",
-				"Cancel",
-				"Proceed and Delete New Files"
-			) != 0)
-			{
-				// User cancelled
+			);
+			if (result == 1) // Cancel
 				return;
-			}
+			deleteNewFiles = (result == 0);
 		}
 		else
 		{
@@ -608,25 +602,34 @@ public static class DiversionStatusOverlay
 				EditorUtility.DisplayDialog("Diversion Reset", $"Successfully reset changes in the selection.", "OK");
 				AssetDatabase.Refresh();
 				UpdateStatusAsync();
-				// Delete empty folders after reset
-				if (canUseTheAll)
+				// Schedule delayed check to delete empty selected folders after Unity refreshes
+				var foldersToCheck = selectedPaths.Where(AssetDatabase.IsValidFolder).ToList();
+				if (foldersToCheck.Count > 0)
 				{
-					DeleteEmptyFoldersRecursive("Assets");
-				}
-				else
-				{
-					foreach (var path in selectedPaths)
-					{
-						if (AssetDatabase.IsValidFolder(path))
-							DeleteEmptyFoldersRecursive(path);
-						else
+					EditorApplication.delayCall += () => {
+						bool anyDeleted = false;
+						foreach (var path in foldersToCheck)
 						{
-							// If a file, check its parent folder
-							var parent = System.IO.Path.GetDirectoryName(path).Replace('\\', '/');
-							if (!string.IsNullOrEmpty(parent) && AssetDatabase.IsValidFolder(parent))
-								DeleteEmptyFoldersRecursive(parent);
+							if (!System.IO.Directory.Exists(path))
+								continue;
+							// Check for non-meta and non-hidden files
+							var files = System.IO.Directory.GetFiles(path).Where(f => !f.EndsWith(".meta") && !System.IO.Path.GetFileName(f).StartsWith(".")).ToArray();
+							var dirs = System.IO.Directory.GetDirectories(path);
+							if (files.Length == 0 && dirs.Length == 0)
+							{
+								AssetDatabase.DeleteAsset(path);
+								anyDeleted = true;
+							}
+							else if (DiversionStatusOverlay.DebugLogsEnabled)
+							{
+								Debug.Log($"Diversion Overlay: Folder '{path}' not deleted because it is not empty. Files: [{string.Join(", ", files.Select(System.IO.Path.GetFileName))}], Subfolders: [{string.Join(", ", dirs.Select(System.IO.Path.GetFileName))}]");
+							}
 						}
-					}
+						if (anyDeleted)
+						{
+							AssetDatabase.Refresh();
+						}
+					};
 				}
 			}
 			else
@@ -703,6 +706,8 @@ public static class DiversionStatusOverlay
 			lastAssetChangeTime = EditorApplication.timeSinceStartup;
 		}
 	}
+
+	public static bool DebugLogsEnabled => EditorPrefs.GetBool(DiversionDebugLogsKey, false);
 }
 
 public class DiversionOverlaySettingsProvider : SettingsProvider
@@ -712,7 +717,6 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 	private string apiKey; // deprecated, but kept for backward compatibility
 	private string repoId;
 	private string workspaceId;
-	private bool accessTokenDirty = false;
 	private string cliPath;
 	private float refreshIntervalSetting;
 	private int maxFilesSetting;
@@ -801,7 +805,7 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 			}
 			else
 			{
-				Debug.LogWarning("Diversion Overlay: Please enter a refresh token first.");
+				if (DiversionStatusOverlay.DebugLogsEnabled) Debug.LogWarning("Diversion Overlay: Please enter a refresh token first.");
 			}
 		}
 
@@ -857,6 +861,14 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 			}
 			EditorGUILayout.LabelField(label, GUILayout.Width(100));
 			EditorGUILayout.EndHorizontal();
+		}
+
+		EditorGUILayout.Space();
+		bool debugLogs = EditorPrefs.GetBool(DiversionStatusOverlay.DiversionDebugLogsKey, false);
+		bool newDebugLogs = EditorGUILayout.Toggle("Enable Debug Logs", debugLogs);
+		if (newDebugLogs != debugLogs)
+		{
+			EditorPrefs.SetBool(DiversionStatusOverlay.DiversionDebugLogsKey, newDebugLogs);
 		}
 
 		GUILayout.EndVertical();
