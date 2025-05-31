@@ -41,6 +41,8 @@ public static class DiversionStatusOverlay
 		maxFilesSetting = EditorPrefs.GetInt(DiversionMaxFilesKey, 1000);
 		// On startup, if token is old, refresh it
 		CheckAndRefreshAccessTokenIfNeeded();
+		// Refresh status when Unity regains focus
+		EditorApplication.focusChanged += OnEditorFocusChanged;
 	}
 
 	static void LoadIcons()
@@ -245,7 +247,7 @@ public static class DiversionStatusOverlay
 		else
 		{
 			if (fileStat != null && statusIcons.TryGetValue(fileStat, out Texture2D icon))
-				iconToDraw = icon;
+					iconToDraw = icon;
 		}
 		if (iconToDraw != null)
 		{
@@ -460,6 +462,12 @@ public static class DiversionStatusOverlay
 			return;
 		}
 
+		// Always fetch the latest status from Diversion before proceeding
+		string statusApiUrl = $"https://api.diversion.dev/v0/repos/{repoId}/workspaces/{workspaceId}/status?detail_items=true&recurse=true&limit=1000";
+		UnityWebRequest statusRequest = UnityWebRequest.Get(statusApiUrl);
+		statusRequest.SetRequestHeader("Authorization", $"Bearer {accessToken}");
+		await statusRequest.SendWebRequest();
+
 		// Gather all selected files and folders (no need to enumerate inside folders)
 		HashSet<string> selectedPaths = new HashSet<string>();
 		foreach (var obj in selected)
@@ -474,42 +482,40 @@ public static class DiversionStatusOverlay
 			return;
 		}
 
-		// Query Diversion status to check for 'new' files in the selection (for delete prompt)
-		string statusApiUrl = $"https://api.diversion.dev/v0/repos/{repoId}/workspaces/{workspaceId}/status?detail_items=true&recurse=true&limit=1000";
 		List<string> newFiles = new List<string>();
-		using (UnityWebRequest statusRequest = UnityWebRequest.Get(statusApiUrl))
+		if (statusRequest.result == UnityWebRequest.Result.Success)
 		{
-			statusRequest.SetRequestHeader("Authorization", $"Bearer {accessToken}");
-			await statusRequest.SendWebRequest();
-			if (statusRequest.result == UnityWebRequest.Result.Success)
+			var json = JObject.Parse(statusRequest.downloadHandler.text);
+			var items = json["items"] as JObject;
+			if (items != null)
 			{
-				var json = JObject.Parse(statusRequest.downloadHandler.text);
-				var items = json["items"] as JObject;
-				if (items != null)
+				var arr = items["new"] as JArray;
+				if (arr != null)
 				{
-					var arr = items["new"] as JArray;
-					if (arr != null)
+					foreach (var entry in arr.OfType<JObject>())
 					{
-						foreach (var entry in arr.OfType<JObject>())
+						string path = entry["path"]?.ToString();
+						if (string.IsNullOrEmpty(path)) continue;
+						// If the new file is directly selected or under a selected folder
+						bool isUnderSelected = false;
+						foreach (var selPath in selectedPaths)
 						{
-							string path = entry["path"]?.ToString();
-							if (string.IsNullOrEmpty(path)) continue;
-							// If the new file is directly selected or under a selected folder
-							bool isUnderSelected = false;
-							foreach (var selPath in selectedPaths)
+							if (path == selPath || (AssetDatabase.IsValidFolder(selPath) && path.StartsWith(selPath + "/")))
 							{
-								if (path == selPath || (AssetDatabase.IsValidFolder(selPath) && path.StartsWith(selPath + "/")))
-								{
-									isUnderSelected = true;
-									break;
-								}
+								isUnderSelected = true;
+								break;
 							}
-							if (isUnderSelected)
-								newFiles.Add(path);
 						}
+						if (isUnderSelected)
+							newFiles.Add(path);
 					}
 				}
 			}
+		}
+		else
+		{
+			EditorUtility.DisplayDialog("Diversion Reset", $"Failed to fetch status from Diversion: {statusRequest.error}", "OK");
+			return;
 		}
 
 		// If all changes are selected, offer to use theall for efficiency
@@ -520,9 +526,26 @@ public static class DiversionStatusOverlay
 				canUseTheAll = true;
 		}
 
+		// For user popup: count unique assets, treating asset and .meta as one
+		HashSet<string> uniqueAssetRoots = new HashSet<string>();
+		foreach (var path in selectedPaths)
+		{
+			if (path.EndsWith(".meta"))
+				uniqueAssetRoots.Add(path.Substring(0, path.Length - 5));
+			else
+				uniqueAssetRoots.Add(path);
+		}
+		foreach (var newFile in newFiles)
+		{
+			if (newFile.EndsWith(".meta"))
+				uniqueAssetRoots.Add(newFile.Substring(0, newFile.Length - 5));
+			else
+				uniqueAssetRoots.Add(newFile);
+		}
+
 		// Confirmation dialog
 		bool deleteNewFiles = false;
-		string message = $"You are about to discard changes on the selected files and folders.";
+		string message = $"You are about to discard changes on {uniqueAssetRoots.Count} file(s) or folder(s) in the selection.";
 		if (newFiles.Count > 0)
 			message += $"\n\n{newFiles.Count} new file(s) will be deleted locally if you choose to delete new files.";
 		if (canUseTheAll)
@@ -585,6 +608,26 @@ public static class DiversionStatusOverlay
 				EditorUtility.DisplayDialog("Diversion Reset", $"Successfully reset changes in the selection.", "OK");
 				AssetDatabase.Refresh();
 				UpdateStatusAsync();
+				// Delete empty folders after reset
+				if (canUseTheAll)
+				{
+					DeleteEmptyFoldersRecursive("Assets");
+				}
+				else
+				{
+					foreach (var path in selectedPaths)
+					{
+						if (AssetDatabase.IsValidFolder(path))
+							DeleteEmptyFoldersRecursive(path);
+						else
+						{
+							// If a file, check its parent folder
+							var parent = System.IO.Path.GetDirectoryName(path).Replace('\\', '/');
+							if (!string.IsNullOrEmpty(parent) && AssetDatabase.IsValidFolder(parent))
+								DeleteEmptyFoldersRecursive(parent);
+						}
+					}
+				}
 			}
 			else
 			{
@@ -624,6 +667,37 @@ public static class DiversionStatusOverlay
 	class DiversionAssetPostprocessor : AssetPostprocessor
 	{
 		static void OnPostprocessAllAssets(string[] importedAssets, string[] deletedAssets, string[] movedAssets, string[] movedFromAssetPaths)
+		{
+			pendingRefresh = true;
+			lastAssetChangeTime = EditorApplication.timeSinceStartup;
+		}
+	}
+
+	// Recursively delete empty folders
+	private static void DeleteEmptyFoldersRecursive(string folderPath)
+	{
+		if (!AssetDatabase.IsValidFolder(folderPath))
+			return;
+
+		// Recurse into subfolders first
+		var subfolders = System.IO.Directory.GetDirectories(folderPath);
+		foreach (var sub in subfolders)
+		{
+			DeleteEmptyFoldersRecursive(sub.Replace('\\', '/'));
+		}
+
+		// After deleting subfolders, check if this folder is now empty
+		var files = System.IO.Directory.GetFiles(folderPath).Where(f => !f.EndsWith(".meta")).ToArray();
+		var dirs = System.IO.Directory.GetDirectories(folderPath);
+		if (files.Length == 0 && dirs.Length == 0)
+		{
+			AssetDatabase.DeleteAsset(folderPath);
+		}
+	}
+
+	private static void OnEditorFocusChanged(bool hasFocus)
+	{
+		if (hasFocus)
 		{
 			pendingRefresh = true;
 			lastAssetChangeTime = EditorApplication.timeSinceStartup;
