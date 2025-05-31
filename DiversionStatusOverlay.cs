@@ -428,9 +428,25 @@ public static class DiversionStatusOverlay
 		return null;
 	}
 
-	[MenuItem("Assets/Diversion/Reset", false, 2000)]
-	public static async void ResetSelectedAsset()
+	[MenuItem("Assets/Diversion/Reset", true, 2000)]
+	private static bool ValidateResetSelectedMulti()
 	{
+		var selected = Selection.objects;
+		if (selected == null || selected.Length == 0) return false;
+		foreach (var obj in selected)
+		{
+			string path = AssetDatabase.GetAssetPath(obj);
+			if (!string.IsNullOrEmpty(path)) return true;
+		}
+		return false;
+	}
+
+	[MenuItem("Assets/Diversion/Reset", false, 2000)]
+	public static async void ResetSelectedMulti()
+	{
+		var selected = Selection.objects;
+		if (selected == null || selected.Length == 0) return;
+
 		string accessToken = EditorPrefs.GetString(DiversionAccessTokenKey, "");
 		string repoId = EditorPrefs.GetString(DiversionRepoIdKey, "");
 		string workspaceId = EditorPrefs.GetString(DiversionWorkspaceIdKey, "");
@@ -443,16 +459,24 @@ public static class DiversionStatusOverlay
 			EditorUtility.DisplayDialog("Diversion Reset", "Missing access token, repo ID, or workspace ID.", "OK");
 			return;
 		}
-		string assetPath = AssetDatabase.GetAssetPath(Selection.activeObject);
-		if (string.IsNullOrEmpty(assetPath))
+
+		// Gather all selected files and folders (no need to enumerate inside folders)
+		HashSet<string> selectedPaths = new HashSet<string>();
+		foreach (var obj in selected)
 		{
-			EditorUtility.DisplayDialog("Diversion Reset", "No asset selected.", "OK");
+			string path = AssetDatabase.GetAssetPath(obj);
+			if (!string.IsNullOrEmpty(path))
+				selectedPaths.Add(path);
+		}
+		if (selectedPaths.Count == 0)
+		{
+			EditorUtility.DisplayDialog("Diversion Reset", "No valid files or folders selected.", "OK");
 			return;
 		}
 
-		// Check if the file is tracked by Diversion
+		// Query Diversion status to check for 'new' files in the selection (for delete prompt)
 		string statusApiUrl = $"https://api.diversion.dev/v0/repos/{repoId}/workspaces/{workspaceId}/status?detail_items=true&recurse=true&limit=1000";
-		bool isTracked = false;
+		List<string> newFiles = new List<string>();
 		using (UnityWebRequest statusRequest = UnityWebRequest.Get(statusApiUrl))
 		{
 			statusRequest.SetRequestHeader("Authorization", $"Bearer {accessToken}");
@@ -463,37 +487,90 @@ public static class DiversionStatusOverlay
 				var items = json["items"] as JObject;
 				if (items != null)
 				{
-					foreach (var category in new[] { "new", "modified", "deleted", "conflicted", "moved" })
+					var arr = items["new"] as JArray;
+					if (arr != null)
 					{
-						var arr = items[category] as JArray;
-						if (arr != null)
+						foreach (var entry in arr.OfType<JObject>())
 						{
-							foreach (var entry in arr.OfType<JObject>())
+							string path = entry["path"]?.ToString();
+							if (string.IsNullOrEmpty(path)) continue;
+							// If the new file is directly selected or under a selected folder
+							bool isUnderSelected = false;
+							foreach (var selPath in selectedPaths)
 							{
-								string path = entry["path"]?.ToString();
-								if (path == assetPath)
+								if (path == selPath || (AssetDatabase.IsValidFolder(selPath) && path.StartsWith(selPath + "/")))
 								{
-									isTracked = true;
+									isUnderSelected = true;
 									break;
 								}
 							}
+							if (isUnderSelected)
+								newFiles.Add(path);
 						}
-						if (isTracked) break;
 					}
 				}
 			}
 		}
-		if (!isTracked)
+
+		// If all changes are selected, offer to use theall for efficiency
+		bool canUseTheAll = false;
 		{
-			EditorUtility.DisplayDialog("Diversion Reset", $"File is not tracked by Diversion and cannot be reset: {assetPath}", "OK");
-			return;
+			// If the user selected the root Assets folder, treat as 'reset all'
+			if (selectedPaths.Contains("Assets"))
+				canUseTheAll = true;
 		}
 
-		string apiUrl = $"https://api.diversion.dev/v0/repos/{repoId}/workspaces/{workspaceId}/reset";
-		var payload = new JObject
+		// Confirmation dialog
+		bool deleteNewFiles = false;
+		string message = $"You are about to discard changes on the selected files and folders.";
+		if (newFiles.Count > 0)
+			message += $"\n\n{newFiles.Count} new file(s) will be deleted locally if you choose to delete new files.";
+		if (canUseTheAll)
+			message += "\n\nYou have selected the root folder. All changes will be reset.";
+		message += "\n\nDo you want to proceed?";
+
+		if (newFiles.Count > 0)
 		{
-			["paths"] = new JArray(assetPath)
-		};
+			deleteNewFiles = EditorUtility.DisplayDialogComplex(
+				"Discard",
+				message,
+				"Proceed and Delete New Files",
+				"Cancel",
+				"Proceed Without Deleting New Files"
+			) == 0;
+			if (!deleteNewFiles && EditorUtility.DisplayDialogComplex(
+				"Discard",
+				message,
+				"Proceed Without Deleting New Files",
+				"Cancel",
+				"Proceed and Delete New Files"
+			) != 0)
+			{
+				// User cancelled
+				return;
+			}
+		}
+		else
+		{
+			if (!EditorUtility.DisplayDialog("Discard", message, "Proceed", "Cancel"))
+				return;
+		}
+
+		// Prepare API call
+		string apiUrl = $"https://api.diversion.dev/v0/repos/{repoId}/workspaces/{workspaceId}/reset";
+		JObject payload;
+		if (canUseTheAll)
+		{
+			payload = new JObject { ["theall"] = true };
+		}
+		else
+		{
+			payload = new JObject { ["paths"] = new JArray(selectedPaths) };
+		}
+		if (deleteNewFiles)
+		{
+			payload["delete_added"] = true;
+		}
 		using (UnityWebRequest webRequest = new UnityWebRequest(apiUrl, "POST"))
 		{
 			string json = payload.ToString();
@@ -505,18 +582,9 @@ public static class DiversionStatusOverlay
 			await webRequest.SendWebRequest();
 			if (webRequest.result == UnityWebRequest.Result.Success)
 			{
-				var response = JObject.Parse(webRequest.downloadHandler.text);
-				var success = response["success"] as JArray;
-				if (success != null && success.Any(x => x.ToString() == assetPath))
-				{
-					EditorUtility.DisplayDialog("Diversion Reset", $"Successfully reset: {assetPath}", "OK");
-					AssetDatabase.Refresh();
-					UpdateStatusAsync();
-				}
-				else
-				{
-					EditorUtility.DisplayDialog("Diversion Reset", $"Reset did not succeed for: {assetPath}", "OK");
-				}
+				EditorUtility.DisplayDialog("Diversion Reset", $"Successfully reset changes in the selection.", "OK");
+				AssetDatabase.Refresh();
+				UpdateStatusAsync();
 			}
 			else
 			{
@@ -581,7 +649,7 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 	[SettingsProvider]
 	public static SettingsProvider CreateSettingsProvider()
 	{
-		return new DiversionOverlaySettingsProvider("Project/Diversion Overlay", SettingsScope.Project);
+		return new DiversionOverlaySettingsProvider("Project/Diversion", SettingsScope.Project);
 	}
 
 	public override void OnActivate(string searchContext, VisualElement rootElement)
@@ -616,7 +684,7 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 		GUILayout.Space(20); // Left margin
 		GUILayout.BeginVertical();
 
-		EditorGUILayout.LabelField("Diversion Overlay Settings", EditorStyles.boldLabel);
+		EditorGUILayout.LabelField("Diversion Settings", EditorStyles.boldLabel);
 		EditorGUILayout.Space();
 
 		// CLI Path at the top
