@@ -11,7 +11,7 @@ using UnityEngine.UIElements;
 [InitializeOnLoad]
 public static class DiversionStatusOverlay
 {
-	static Dictionary<string, Texture2D> statusIcons = new();
+	internal static Dictionary<string, Texture2D> statusIcons = new();
 	static Dictionary<string, string> fileStatus = new();
 	static Dictionary<string, string> folderStatus = new();
 
@@ -23,6 +23,8 @@ public static class DiversionStatusOverlay
 	public const string DiversionCLIPathKey = "DiversionOverlay.CLIPath";
 	public const string DiversionRefreshDelayKey = "DiversionOverlay.RefreshDelay";
 	public const string DiversionMaxFilesKey = "DiversionOverlay.MaxFiles";
+	public const string DiversionAccessTokenLastRefreshKey = "DiversionOverlay.AccessTokenLastRefresh";
+	private const double AccessTokenRefreshIntervalSeconds = 59 * 60; // 59 minutes
 
 	private static bool pendingRefresh = false;
 	private static double lastAssetChangeTime = 0;
@@ -37,13 +39,15 @@ public static class DiversionStatusOverlay
 		UpdateStatusAsync();
 		refreshDelay = EditorPrefs.GetFloat(DiversionRefreshDelayKey, 1.0f);
 		maxFilesSetting = EditorPrefs.GetInt(DiversionMaxFilesKey, 1000);
+		// On startup, if token is old, refresh it
+		CheckAndRefreshAccessTokenIfNeeded();
 	}
 
 	static void LoadIcons()
 	{
 		statusIcons["A"] = EditorGUIUtility.FindTexture("PackageBadgeNew");
 		statusIcons["M"] = EditorGUIUtility.FindTexture("d_CollabEdit Icon");
-		statusIcons["D"] = EditorGUIUtility.FindTexture("Collab.FileDeleted");
+		statusIcons["D"] = EditorGUIUtility.FindTexture("CollabDeleted Icon");
 		statusIcons["C"] = EditorGUIUtility.FindTexture("d_CollabConflict Icon");
 		statusIcons["U"] = EditorGUIUtility.FindTexture("Collab");
 		statusIcons["moved"] = EditorGUIUtility.FindTexture("CollabMoved Icon");
@@ -51,7 +55,7 @@ public static class DiversionStatusOverlay
 		statusIcons["deleted"] = statusIcons["D"];
 		statusIcons["modified"] = statusIcons["M"];
 		statusIcons["conflicted"] = statusIcons["C"];
-		statusIcons["uptodate"] = statusIcons["U"];
+		// No icon for 'uptodate' status
 	}
 
 	public static async Task ExchangeRefreshTokenForAccessToken(string refreshToken)
@@ -80,6 +84,7 @@ public static class DiversionStatusOverlay
 				{
 					EditorPrefs.SetString(DiversionAccessTokenKey, accessToken);
 					Debug.Log("Diversion Overlay: Access token updated.");
+					EditorPrefs.SetFloat(DiversionAccessTokenLastRefreshKey, (float)EditorApplication.timeSinceStartup);
 				}
 				else
 				{
@@ -528,6 +533,23 @@ public static class DiversionStatusOverlay
 			pendingRefresh = false;
 			UpdateStatusAsync();
 		}
+		// Check if access token needs to be refreshed
+		CheckAndRefreshAccessTokenIfNeeded();
+	}
+
+	static void CheckAndRefreshAccessTokenIfNeeded()
+	{
+		double lastRefresh = EditorPrefs.GetFloat(DiversionAccessTokenLastRefreshKey, 0f);
+		double now = EditorApplication.timeSinceStartup;
+		if (now - lastRefresh > AccessTokenRefreshIntervalSeconds)
+		{
+			string refreshToken = EditorPrefs.GetString(DiversionRefreshTokenKey, "");
+			if (!string.IsNullOrEmpty(refreshToken))
+			{
+				_ = ExchangeRefreshTokenForAccessToken(refreshToken);
+				EditorPrefs.SetFloat(DiversionAccessTokenLastRefreshKey, (float)now);
+			}
+		}
 	}
 
 	// AssetPostprocessor to trigger status update on asset changes
@@ -658,6 +680,41 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 		if (EditorGUI.EndChangeCheck())
 		{
 			EditorPrefs.SetInt(DiversionStatusOverlay.DiversionMaxFilesKey, maxFilesSetting);
+		}
+
+		EditorGUILayout.Space();
+		EditorGUILayout.LabelField("Status Icon Legend", EditorStyles.boldLabel);
+		var legend = new (string label, string key)[] {
+			("Added", "added"),
+			("Modified", "modified"),
+			("Deleted", "deleted"),
+			("Conflicted", "conflicted"),
+			("Moved", "moved")
+			// No icon for 'Up to date'
+		};
+		foreach (var (label, key) in legend)
+		{
+			Texture2D icon = null;
+			DiversionStatusOverlay.statusIcons.TryGetValue(key, out icon);
+			EditorGUILayout.BeginHorizontal();
+			GUILayout.Space(10);
+			if (icon != null)
+			{
+				float maxHeight = 20f;
+				float maxWidth = 32f;
+				float width = icon.width;
+				float height = icon.height;
+				float aspect = width / height;
+				float drawHeight = Mathf.Min(maxHeight, height);
+				float drawWidth = Mathf.Min(maxWidth, drawHeight * aspect, width);
+				GUILayout.Label(icon, GUILayout.Width(drawWidth), GUILayout.Height(drawHeight));
+			}
+			else
+			{
+				GUILayout.Label("");
+			}
+			EditorGUILayout.LabelField(label, GUILayout.Width(100));
+			EditorGUILayout.EndHorizontal();
 		}
 
 		GUILayout.EndVertical();
