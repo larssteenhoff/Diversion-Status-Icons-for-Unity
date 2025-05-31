@@ -86,7 +86,7 @@ public static class DiversionStatusOverlay
 				if (!string.IsNullOrEmpty(accessToken) && accessToken.Count(c => c == '.') == 2)
 				{
 					EditorPrefs.SetString(DiversionAccessTokenKey, accessToken);
-					Debug.Log("Diversion Overlay: Access token updated.");
+					if (DebugLogsEnabled) Debug.Log("Diversion Overlay: Access token updated.");
 					EditorPrefs.SetFloat(DiversionAccessTokenLastRefreshKey, (float)EditorApplication.timeSinceStartup);
 				}
 				else
@@ -187,7 +187,15 @@ public static class DiversionStatusOverlay
 		{
 			string path = item["path"]?.Value<string>();
 			if (!string.IsNullOrEmpty(path) && path.StartsWith("Assets"))
+			{
 				fileStatus[path] = "added";
+				if (path.EndsWith(".meta"))
+				{
+					string assetPath = path.Substring(0, path.Length - 5);
+					if (!fileStatus.ContainsKey(assetPath))
+						fileStatus[assetPath] = "added";
+				}
+			}
 		}
 		// Modified
 		foreach (var item in json["items"]?["modified"]?.OfType<JObject>() ?? Enumerable.Empty<JObject>())
@@ -196,14 +204,30 @@ public static class DiversionStatusOverlay
 			string prevPath = item["prev_path"]?.Value<string>();
 			string status = (!string.IsNullOrEmpty(prevPath) && prevPath != path) ? "moved" : "modified";
 			if (!string.IsNullOrEmpty(path) && path.StartsWith("Assets"))
+			{
 				fileStatus[path] = status;
+				if (path.EndsWith(".meta"))
+				{
+					string assetPath = path.Substring(0, path.Length - 5);
+					if (!fileStatus.ContainsKey(assetPath))
+						fileStatus[assetPath] = status;
+				}
+			}
 		}
 		// Deleted
 		foreach (var item in json["items"]?["deleted"]?.OfType<JObject>() ?? Enumerable.Empty<JObject>())
 		{
 			string path = item["path"]?.Value<string>();
 			if (!string.IsNullOrEmpty(path) && path.StartsWith("Assets"))
+			{
 				fileStatus[path] = "deleted";
+				if (path.EndsWith(".meta"))
+				{
+					string assetPath = path.Substring(0, path.Length - 5);
+					if (!fileStatus.ContainsKey(assetPath))
+						fileStatus[assetPath] = "deleted";
+				}
+			}
 		}
 		if (DiversionStatusOverlay.DebugLogsEnabled) Debug.Log($"Diversion Overlay: Parsed {fileStatus.Count} file statuses from API.");
 		PropagateStatusToFolders();
@@ -476,7 +500,15 @@ public static class DiversionStatusOverlay
 		{
 			string path = AssetDatabase.GetAssetPath(obj);
 			if (!string.IsNullOrEmpty(path))
+			{
 				selectedPaths.Add(path);
+				if (!path.EndsWith(".meta"))
+				{
+					string metaPath = path + ".meta";
+					if (System.IO.File.Exists(metaPath))
+						selectedPaths.Add(metaPath);
+				}
+			}
 		}
 		if (selectedPaths.Count == 0)
 		{
