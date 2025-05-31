@@ -51,3 +51,4 @@ It uses the Diversion command-line interface (`dv`) to fetch the status of files
 *   If menu items or icons don't appear, check the Unity console for compilation errors in `DiversionStatusOverlay.cs`. Resolve any errors and restart Unity.
 *   Ensure the `DiversionCLIPath` is correct and the `dv status --porcelain` command works correctly in your terminal from the project root directory.
 *   If the "Revert Selected" command fails, check the Unity console for output from the Diversion CLI. The error message may provide clues (e.g., incomplete sync).
+![Diversion Status Icons for Unity](https://github.com/larssteenhoff/Diversion-Status-Icons-for-Unity/blob/main/settings.png?raw=true)
