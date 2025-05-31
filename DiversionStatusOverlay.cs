@@ -21,6 +21,13 @@ public static class DiversionStatusOverlay
 	public const string DiversionRefreshTokenKey = "DiversionOverlay.RefreshToken";
 	public const string DiversionAccessTokenKey = "DiversionOverlay.AccessToken";
 	public const string DiversionCLIPathKey = "DiversionOverlay.CLIPath";
+	public const string DiversionRefreshDelayKey = "DiversionOverlay.RefreshDelay";
+	public const string DiversionMaxFilesKey = "DiversionOverlay.MaxFiles";
+
+	private static bool pendingRefresh = false;
+	private static double lastAssetChangeTime = 0;
+	private static float refreshDelay = 1.0f; // default 1 second
+	private static int maxFilesSetting;
 
 	static DiversionStatusOverlay()
 	{
@@ -28,6 +35,8 @@ public static class DiversionStatusOverlay
 		EditorApplication.projectWindowItemOnGUI += OnProjectWindowItemGUI;
 		EditorApplication.update += OnEditorUpdate;
 		UpdateStatusAsync();
+		refreshDelay = EditorPrefs.GetFloat(DiversionRefreshDelayKey, 1.0f);
+		maxFilesSetting = EditorPrefs.GetInt(DiversionMaxFilesKey, 1000);
 	}
 
 	static void LoadIcons()
@@ -90,7 +99,7 @@ public static class DiversionStatusOverlay
 		string repoId = EditorPrefs.GetString(DiversionRepoIdKey, "");
 		string workspaceId = EditorPrefs.GetString(DiversionWorkspaceIdKey, "");
 
-		// Auto-add Diversion prefixes if missing
+		// Ensure Diversion prefixes are present
 		if (!string.IsNullOrEmpty(repoId) && !repoId.StartsWith("dv.repo."))
 			repoId = "dv.repo." + repoId;
 		if (!string.IsNullOrEmpty(workspaceId) && !workspaceId.StartsWith("dv.ws."))
@@ -102,25 +111,62 @@ public static class DiversionStatusOverlay
 			return;
 		}
 
-		string apiUrl = $"https://api.diversion.dev/v0/repos/{repoId}/workspaces/{workspaceId}/status?detail_items=true&recurse=true&limit=1000";
-		Debug.Log($"Diversion Overlay: Using API URL: {apiUrl}");
-		Debug.Log($"Repo ID: {repoId}, Workspace ID: {workspaceId}");
-		Debug.Log("Diversion Overlay: Fetching status from API...");
+		int limit = EditorPrefs.GetInt(DiversionMaxFilesKey, 1000);
+		int skip = 0;
+		bool more = true;
+		JObject combinedItems = new JObject();
+		string[] categories = new[] { "new", "modified", "deleted", "conflicted", "moved" };
+		foreach (var cat in categories) combinedItems[cat] = new JArray();
 
-		using (UnityWebRequest webRequest = UnityWebRequest.Get(apiUrl))
+		while (more)
 		{
-			webRequest.SetRequestHeader("Authorization", $"Bearer {accessToken}");
-			await webRequest.SendWebRequest();
-
-			if (webRequest.result != UnityWebRequest.Result.Success)
+			string apiUrl = $"https://api.diversion.dev/v0/repos/{repoId}/workspaces/{workspaceId}/status?detail_items=true&recurse=true&limit={limit}&skip={skip}";
+			Debug.Log($"Diversion Overlay: Fetching status from API (skip={skip})...");
+			using (UnityWebRequest webRequest = UnityWebRequest.Get(apiUrl))
 			{
-				Debug.LogError("Diversion Overlay: API Request Failed: " + webRequest.error);
-				return;
-			}
+				webRequest.SetRequestHeader("Authorization", $"Bearer {accessToken}");
+				await webRequest.SendWebRequest();
 
-			ParseDiversionAPIOutput(webRequest.downloadHandler.text);
-			EditorApplication.RepaintProjectWindow();
+				if (webRequest.result != UnityWebRequest.Result.Success)
+				{
+					Debug.LogError("Diversion Overlay: API Request Failed: " + webRequest.error);
+					return;
+				}
+
+				JObject json = JObject.Parse(webRequest.downloadHandler.text);
+				var items = json["items"] as JObject;
+				if (items != null)
+				{
+					int itemsAddedThisPage = 0;
+					foreach (var cat in categories)
+					{
+						var arr = items[cat] as JArray;
+						if (arr != null && arr.Count > 0)
+						{
+							((JArray)combinedItems[cat]).Merge(arr);
+							itemsAddedThisPage += arr.Count;
+						}
+					}
+					if (itemsAddedThisPage < limit)
+					{
+						more = false;
+					}
+					else
+					{
+						skip += limit;
+					}
+				}
+				else
+				{
+					more = false;
+				}
+			}
 		}
+
+		// Build a fake status JSON to pass to ParseDiversionAPIOutput
+		JObject fakeStatusJson = new JObject { ["items"] = combinedItems };
+		ParseDiversionAPIOutput(fakeStatusJson.ToString());
+		EditorApplication.RepaintProjectWindow();
 	}
 
 	static void ParseDiversionAPIOutput(string jsonOutput)
@@ -213,11 +259,6 @@ public static class DiversionStatusOverlay
 			);
 			GUI.DrawTexture(iconRect, iconToDraw, ScaleMode.ScaleToFit);
 		}
-	}
-
-	static void OnEditorUpdate()
-	{
-		// Optionally, schedule periodic refreshes here
 	}
 
 	[MenuItem("Tools/Diversion/Refresh Status")]
@@ -381,6 +422,123 @@ public static class DiversionStatusOverlay
 		}
 		return null;
 	}
+
+	[MenuItem("Assets/Diversion/Reset", false, 2000)]
+	public static async void ResetSelectedAsset()
+	{
+		string accessToken = EditorPrefs.GetString(DiversionAccessTokenKey, "");
+		string repoId = EditorPrefs.GetString(DiversionRepoIdKey, "");
+		string workspaceId = EditorPrefs.GetString(DiversionWorkspaceIdKey, "");
+		if (!string.IsNullOrEmpty(repoId) && !repoId.StartsWith("dv.repo."))
+			repoId = "dv.repo." + repoId;
+		if (!string.IsNullOrEmpty(workspaceId) && !workspaceId.StartsWith("dv.ws."))
+			workspaceId = "dv.ws." + workspaceId;
+		if (string.IsNullOrEmpty(accessToken) || string.IsNullOrEmpty(repoId) || string.IsNullOrEmpty(workspaceId))
+		{
+			EditorUtility.DisplayDialog("Diversion Reset", "Missing access token, repo ID, or workspace ID.", "OK");
+			return;
+		}
+		string assetPath = AssetDatabase.GetAssetPath(Selection.activeObject);
+		if (string.IsNullOrEmpty(assetPath))
+		{
+			EditorUtility.DisplayDialog("Diversion Reset", "No asset selected.", "OK");
+			return;
+		}
+
+		// Check if the file is tracked by Diversion
+		string statusApiUrl = $"https://api.diversion.dev/v0/repos/{repoId}/workspaces/{workspaceId}/status?detail_items=true&recurse=true&limit=1000";
+		bool isTracked = false;
+		using (UnityWebRequest statusRequest = UnityWebRequest.Get(statusApiUrl))
+		{
+			statusRequest.SetRequestHeader("Authorization", $"Bearer {accessToken}");
+			await statusRequest.SendWebRequest();
+			if (statusRequest.result == UnityWebRequest.Result.Success)
+			{
+				var json = JObject.Parse(statusRequest.downloadHandler.text);
+				var items = json["items"] as JObject;
+				if (items != null)
+				{
+					foreach (var category in new[] { "new", "modified", "deleted", "conflicted", "moved" })
+					{
+						var arr = items[category] as JArray;
+						if (arr != null)
+						{
+							foreach (var entry in arr.OfType<JObject>())
+							{
+								string path = entry["path"]?.ToString();
+								if (path == assetPath)
+								{
+									isTracked = true;
+									break;
+								}
+							}
+						}
+						if (isTracked) break;
+					}
+				}
+			}
+		}
+		if (!isTracked)
+		{
+			EditorUtility.DisplayDialog("Diversion Reset", $"File is not tracked by Diversion and cannot be reset: {assetPath}", "OK");
+			return;
+		}
+
+		string apiUrl = $"https://api.diversion.dev/v0/repos/{repoId}/workspaces/{workspaceId}/reset";
+		var payload = new JObject
+		{
+			["paths"] = new JArray(assetPath)
+		};
+		using (UnityWebRequest webRequest = new UnityWebRequest(apiUrl, "POST"))
+		{
+			string json = payload.ToString();
+			byte[] bodyRaw = System.Text.Encoding.UTF8.GetBytes(json);
+			webRequest.uploadHandler = new UploadHandlerRaw(bodyRaw);
+			webRequest.downloadHandler = new DownloadHandlerBuffer();
+			webRequest.SetRequestHeader("Authorization", $"Bearer {accessToken}");
+			webRequest.SetRequestHeader("Content-Type", "application/json");
+			await webRequest.SendWebRequest();
+			if (webRequest.result == UnityWebRequest.Result.Success)
+			{
+				var response = JObject.Parse(webRequest.downloadHandler.text);
+				var success = response["success"] as JArray;
+				if (success != null && success.Any(x => x.ToString() == assetPath))
+				{
+					EditorUtility.DisplayDialog("Diversion Reset", $"Successfully reset: {assetPath}", "OK");
+					AssetDatabase.Refresh();
+					UpdateStatusAsync();
+				}
+				else
+				{
+					EditorUtility.DisplayDialog("Diversion Reset", $"Reset did not succeed for: {assetPath}", "OK");
+				}
+			}
+			else
+			{
+				EditorUtility.DisplayDialog("Diversion Reset Failed", $"Error: {webRequest.error}\n{webRequest.downloadHandler.text}", "OK");
+			}
+		}
+	}
+
+	static void OnEditorUpdate()
+	{
+		refreshDelay = EditorPrefs.GetFloat(DiversionRefreshDelayKey, 1.0f);
+		if (pendingRefresh && (EditorApplication.timeSinceStartup - lastAssetChangeTime > refreshDelay))
+		{
+			pendingRefresh = false;
+			UpdateStatusAsync();
+		}
+	}
+
+	// AssetPostprocessor to trigger status update on asset changes
+	class DiversionAssetPostprocessor : AssetPostprocessor
+	{
+		static void OnPostprocessAllAssets(string[] importedAssets, string[] deletedAssets, string[] movedAssets, string[] movedFromAssetPaths)
+		{
+			pendingRefresh = true;
+			lastAssetChangeTime = EditorApplication.timeSinceStartup;
+		}
+	}
 }
 
 public class DiversionOverlaySettingsProvider : SettingsProvider
@@ -392,6 +550,8 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 	private string workspaceId;
 	private bool accessTokenDirty = false;
 	private string cliPath;
+	private float refreshIntervalSetting;
+	private int maxFilesSetting;
 
 	public DiversionOverlaySettingsProvider(string path, SettingsScope scope = SettingsScope.Project)
 		: base(path, scope) { }
@@ -423,6 +583,7 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 			cliPath = DiversionStatusOverlay.AutoDetectDiversionCLIPath() ?? "";
 		if (!string.IsNullOrEmpty(cliPath))
 			EditorPrefs.SetString(DiversionStatusOverlay.DiversionCLIPathKey, cliPath);
+		maxFilesSetting = EditorPrefs.GetInt(DiversionStatusOverlay.DiversionMaxFilesKey, 1000);
 	}
 
 	public override void OnGUI(string searchContext)
@@ -478,6 +639,25 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 			{
 				Debug.LogWarning("Diversion Overlay: Please enter a refresh token first.");
 			}
+		}
+
+		EditorGUILayout.Space();
+		EditorGUILayout.LabelField("Status Refresh Delay After Change (seconds)");
+		EditorGUI.BeginChangeCheck();
+		float delaySetting = EditorPrefs.GetFloat(DiversionStatusOverlay.DiversionRefreshDelayKey, 1.0f);
+		delaySetting = EditorGUILayout.Slider(delaySetting, 0.1f, 10.0f);
+		if (EditorGUI.EndChangeCheck())
+		{
+			EditorPrefs.SetFloat(DiversionStatusOverlay.DiversionRefreshDelayKey, delaySetting);
+		}
+
+		EditorGUILayout.Space();
+		EditorGUILayout.LabelField("Max Files to Check per API Call");
+		EditorGUI.BeginChangeCheck();
+		maxFilesSetting = EditorGUILayout.IntSlider(maxFilesSetting, 100, 5000);
+		if (EditorGUI.EndChangeCheck())
+		{
+			EditorPrefs.SetInt(DiversionStatusOverlay.DiversionMaxFilesKey, maxFilesSetting);
 		}
 
 		GUILayout.EndVertical();
