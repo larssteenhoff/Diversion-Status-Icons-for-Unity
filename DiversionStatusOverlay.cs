@@ -20,6 +20,7 @@ public static class DiversionStatusOverlay
 	public const string DiversionAPIKey = "DiversionOverlay.APIKey";
 	public const string DiversionRefreshTokenKey = "DiversionOverlay.RefreshToken";
 	public const string DiversionAccessTokenKey = "DiversionOverlay.AccessToken";
+	public const string DiversionCLIPathKey = "DiversionOverlay.CLIPath";
 
 	static DiversionStatusOverlay()
 	{
@@ -228,7 +229,18 @@ public static class DiversionStatusOverlay
 
 	public static void FetchRepoAndWorkspaceIds()
 	{
-		string diversionCLIPath = "/Users/macstudio/.diversion/bin/dv"; // Update if needed
+		string diversionCLIPath = EditorPrefs.GetString(DiversionCLIPathKey, "");
+		if (string.IsNullOrEmpty(diversionCLIPath) || !System.IO.File.Exists(diversionCLIPath))
+		{
+			diversionCLIPath = AutoDetectDiversionCLIPath();
+			if (!string.IsNullOrEmpty(diversionCLIPath))
+				EditorPrefs.SetString(DiversionCLIPathKey, diversionCLIPath);
+		}
+		if (string.IsNullOrEmpty(diversionCLIPath) || !System.IO.File.Exists(diversionCLIPath))
+		{
+			Debug.LogError("Diversion Overlay: Could not find Diversion CLI (dv). Please set the path in Project Settings.");
+			return;
+		}
 		var psi = new System.Diagnostics.ProcessStartInfo
 		{
 			FileName = diversionCLIPath,
@@ -238,17 +250,14 @@ public static class DiversionStatusOverlay
 			UseShellExecute = false,
 			CreateNoWindow = true
 		};
-
 		try
 		{
 			using (var process = System.Diagnostics.Process.Start(psi))
 			{
 				string output = process.StandardOutput.ReadToEnd();
 				process.WaitForExit();
-
 				string repoId = null;
 				string workspaceId = null;
-
 				using (var reader = new System.IO.StringReader(output))
 				{
 					string line;
@@ -274,7 +283,6 @@ public static class DiversionStatusOverlay
 						}
 					}
 				}
-
 				if (!string.IsNullOrEmpty(repoId) && !string.IsNullOrEmpty(workspaceId))
 				{
 					EditorPrefs.SetString(DiversionRepoIdKey, repoId);
@@ -292,6 +300,87 @@ public static class DiversionStatusOverlay
 			Debug.LogError("Diversion Overlay: Error fetching repo/workspace IDs: " + ex.Message);
 		}
 	}
+
+	public static string AutoDetectDiversionCLIPath()
+	{
+		string userProfile = System.Environment.GetFolderPath(System.Environment.SpecialFolder.UserProfile);
+		string[] possiblePaths;
+		if (Application.platform == RuntimePlatform.WindowsEditor)
+		{
+			possiblePaths = new[] {
+				userProfile + "\\.diversion\\bin\\dv.exe",
+				"C:\\Program Files\\Diversion\\dv.exe"
+			};
+			foreach (var path in possiblePaths)
+			{
+				if (System.IO.File.Exists(path))
+					return path;
+			}
+			// Try PATH (Windows)
+			try
+			{
+				var psi = new System.Diagnostics.ProcessStartInfo
+				{
+					FileName = "where",
+					Arguments = "dv",
+					RedirectStandardOutput = true,
+					UseShellExecute = false,
+					CreateNoWindow = true
+				};
+				using (var process = System.Diagnostics.Process.Start(psi))
+				{
+					string output = process.StandardOutput.ReadToEnd();
+					process.WaitForExit();
+					if (!string.IsNullOrEmpty(output))
+					{
+						string cliPath = output.Split(new[] { '\r', '\n' }, System.StringSplitOptions.RemoveEmptyEntries)[0];
+						if (System.IO.File.Exists(cliPath))
+							return cliPath;
+					}
+				}
+			}
+			catch { }
+		}
+		else // macOS/Linux
+		{
+			possiblePaths = new[] {
+				userProfile + "/.diversion/bin/dv",
+				"/usr/local/bin/dv",
+				"/opt/homebrew/bin/dv",
+				"/usr/bin/dv"
+			};
+			foreach (var path in possiblePaths)
+			{
+				if (System.IO.File.Exists(path))
+					return path;
+			}
+			// Try PATH (Unix)
+			try
+			{
+				var psi = new System.Diagnostics.ProcessStartInfo
+				{
+					FileName = "which",
+					Arguments = "dv",
+					RedirectStandardOutput = true,
+					UseShellExecute = false,
+					CreateNoWindow = true
+				};
+				using (var process = System.Diagnostics.Process.Start(psi))
+				{
+					string output = process.StandardOutput.ReadToEnd();
+					process.WaitForExit();
+					if (!string.IsNullOrEmpty(output))
+					{
+						string cliPath = output.Split(new[] { '\r', '\n' }, System.StringSplitOptions.RemoveEmptyEntries)[0];
+						if (System.IO.File.Exists(cliPath))
+							return cliPath;
+					}
+				}
+			}
+			catch { }
+		}
+		return null;
+	}
 }
 
 public class DiversionOverlaySettingsProvider : SettingsProvider
@@ -302,6 +391,7 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 	private string repoId;
 	private string workspaceId;
 	private bool accessTokenDirty = false;
+	private string cliPath;
 
 	public DiversionOverlaySettingsProvider(string path, SettingsScope scope = SettingsScope.Project)
 		: base(path, scope) { }
@@ -328,28 +418,43 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 		workspaceId = EditorPrefs.GetString(DiversionStatusOverlay.DiversionWorkspaceIdKey, "");
 		if (!string.IsNullOrEmpty(workspaceId) && !workspaceId.StartsWith("dv.ws."))
 			workspaceId = "dv.ws." + workspaceId;
+		cliPath = EditorPrefs.GetString(DiversionStatusOverlay.DiversionCLIPathKey, "");
+		if (string.IsNullOrEmpty(cliPath) || !System.IO.File.Exists(cliPath))
+			cliPath = DiversionStatusOverlay.AutoDetectDiversionCLIPath() ?? "";
+		if (!string.IsNullOrEmpty(cliPath))
+			EditorPrefs.SetString(DiversionStatusOverlay.DiversionCLIPathKey, cliPath);
 	}
 
 	public override void OnGUI(string searchContext)
 	{
+		EditorGUILayout.Space();
+		EditorGUILayout.Space();
+		GUILayout.BeginHorizontal();
+		GUILayout.Space(20); // Left margin
+		GUILayout.BeginVertical();
+
 		EditorGUILayout.LabelField("Diversion Overlay Settings", EditorStyles.boldLabel);
+		EditorGUILayout.Space();
+
+		// CLI Path at the top
+		EditorGUILayout.LabelField("Diversion CLI Path");
+		EditorGUILayout.SelectableLabel(cliPath, EditorStyles.textField, GUILayout.Height(18));
+		if (GUILayout.Button("Auto-detect Diversion CLI Path"))
+		{
+			cliPath = DiversionStatusOverlay.AutoDetectDiversionCLIPath() ?? "";
+			if (!string.IsNullOrEmpty(cliPath))
+				EditorPrefs.SetString(DiversionStatusOverlay.DiversionCLIPathKey, cliPath);
+			ReloadFields();
+		}
 		EditorGUILayout.Space();
 
 		EditorGUI.BeginChangeCheck();
 		refreshToken = EditorGUILayout.TextField("Refresh Token", refreshToken);
+		EditorGUILayout.Space();
 		EditorGUILayout.LabelField("Repo ID");
 		EditorGUILayout.SelectableLabel(repoId, EditorStyles.textField, GUILayout.Height(18));
 		EditorGUILayout.LabelField("Workspace ID");
 		EditorGUILayout.SelectableLabel(workspaceId, EditorStyles.textField, GUILayout.Height(18));
-		if (EditorGUI.EndChangeCheck())
-		{
-			EditorPrefs.SetString(DiversionStatusOverlay.DiversionRefreshTokenKey, refreshToken);
-			// When refresh token changes, get new access token
-			if (!string.IsNullOrEmpty(refreshToken))
-			{
-				_ = DiversionStatusOverlay.ExchangeRefreshTokenForAccessToken(refreshToken);
-			}
-		}
 
 		EditorGUILayout.Space();
 		if (GUILayout.Button("Auto-detect IDs from CLI"))
@@ -374,6 +479,10 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 				Debug.LogWarning("Diversion Overlay: Please enter a refresh token first.");
 			}
 		}
+
+		GUILayout.EndVertical();
+		GUILayout.Space(20); // Right margin
+		GUILayout.EndHorizontal();
 	}
 }
 #endif
