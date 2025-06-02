@@ -1344,7 +1344,12 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 		EditorGUILayout.Space();
 
 		EditorGUI.BeginChangeCheck();
-		refreshToken = EditorGUILayout.TextField("Integration Token", refreshToken);
+		string newRefreshToken = EditorGUILayout.TextField("Integration Token", refreshToken);
+		if (newRefreshToken != refreshToken)
+		{
+			refreshToken = newRefreshToken;
+			EditorPrefs.SetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionRefreshTokenKey), refreshToken);
+		}
 		EditorGUILayout.Space();
 		EditorGUILayout.LabelField("Repo ID");
 		EditorGUILayout.SelectableLabel(repoId, EditorStyles.textField, GUILayout.Height(18));
