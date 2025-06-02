@@ -860,7 +860,8 @@ public static class DiversionStatusOverlay
 		var selected = Selection.activeObject;
 		if (selected == null) return false;
 		string path = AssetDatabase.GetAssetPath(selected);
-		return !string.IsNullOrEmpty(path) && (System.IO.File.Exists(path) || AssetDatabase.IsValidFolder(path));
+		// Only allow for files, not folders
+		return !string.IsNullOrEmpty(path) && System.IO.File.Exists(path);
 	}
 
 	// Helper to get Diversion agent port from ~/.diversion/.port
@@ -899,8 +900,8 @@ public static class DiversionStatusOverlay
 		string repoRoot = FindRepoRoot(assetPath);
 		if (repoRoot == null)
 			return (null, null, null);
-		if (DebugLogsEnabled) Debug.Log($"Diversion Overlay: Looking up workspace config for repoRoot={repoRoot}, abs_path={UnityWebRequest.EscapeURL(repoRoot)}");
-		string url = $"{apiBase}/v0/workspaces/by-path?abs_path={UnityWebRequest.EscapeURL(repoRoot)}";
+		if (DebugLogsEnabled) Debug.Log($"Diversion Overlay: Looking up workspace config for repoRoot={repoRoot}, abs_path={UnityWebRequest.EscapeURL(repoRoot).Replace("+", "%20")}");
+		string url = $"{apiBase}/v0/workspaces/by-path?abs_path={UnityWebRequest.EscapeURL(repoRoot).Replace("+", "%20")}";
 		using (UnityWebRequest req = UnityWebRequest.Get(url))
 		{
 			await req.SendWebRequest();
@@ -941,7 +942,7 @@ public static class DiversionStatusOverlay
 	private static async Task<List<(string id, string message)>> GetFileCommitHistory(string repoId, string refId, string relPath, string accessToken)
 	{
 		var commits = new List<(string, string)>();
-		string url = $"https://api.diversion.dev/v0/repos/{repoId}/object-history/{refId}/{UnityWebRequest.EscapeURL(relPath)}";
+		string url = $"https://api.diversion.dev/v0/repos/{repoId}/object-history/{refId}/{UnityWebRequest.EscapeURL(relPath).Replace("+", "%20")}";
 		if (DebugLogsEnabled)
 			Debug.Log($"Diversion Overlay: Commit history API: {url}");
 		using (UnityWebRequest req = UnityWebRequest.Get(url))
@@ -1062,7 +1063,7 @@ public static class DiversionStatusOverlay
 	// Helper to download a blob (file at a specific ref)
 	private static async Task<bool> DownloadBlob(string repoId, string refId, string relPath, string accessToken, string outputPath)
 	{
-		string url = $"https://api.diversion.dev/v0/repos/{repoId}/blobs/{refId}/{UnityWebRequest.EscapeURL(relPath)}";
+		string url = $"https://api.diversion.dev/v0/repos/{repoId}/blobs/{refId}/{UnityWebRequest.EscapeURL(relPath).Replace("+", "%20")}";
 		using (UnityWebRequest req = UnityWebRequest.Get(url))
 		{
 			req.SetRequestHeader("Authorization", $"Bearer {accessToken}");
@@ -1160,106 +1161,65 @@ public static class DiversionStatusOverlay
 	}
 
 	[MenuItem("Assets/Diversion/Download Latest From Diversion", false, 2150)]
-	public static void ShowDownloadLatestFromDiversionWindow()
+	public static async void DownloadLatestFromDiversionImmediate()
 	{
-		DiversionDownloadWindow.ShowWindow();
-	}
-
-	public class DiversionDownloadWindow : EditorWindow
-	{
-		private string repoId = "dv.repo.xxxxx";
-		private string branchId = "dv.branch.1";
-		private string relPath = "Assets/Diversion/Editor/DiversionStatusOverlay.cs";
-		private string workspaceId = "";
-		private string status = "";
-
-		public static void ShowWindow()
+		var selected = Selection.objects;
+		List<string> selectedPaths = new List<string>();
+		if (selected != null && selected.Length > 0)
 		{
-			var window = GetWindow<DiversionDownloadWindow>(true, "Download from Diversion");
-			window.minSize = new Vector2(400, 220);
-			window.InitWorkspaceId();
-		}
-
-		private async void InitWorkspaceId()
-		{
-			DiversionStatusOverlay.FetchRepoAndWorkspaceIds();
-			await System.Threading.Tasks.Task.Delay(200); // Give CLI a moment to finish (not perfect, but avoids race)
-			repoId = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionRepoIdKey), repoId);
-			workspaceId = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionWorkspaceIdKey), workspaceId);
-			if (!string.IsNullOrEmpty(repoId) && !repoId.StartsWith("dv.repo."))
-				repoId = "dv.repo." + repoId;
-			if (!string.IsNullOrEmpty(workspaceId) && !workspaceId.StartsWith("dv.ws."))
-				workspaceId = "dv.ws." + workspaceId;
-			if (!string.IsNullOrEmpty(branchId) && !branchId.StartsWith("dv.branch."))
-				branchId = "dv.branch." + branchId;
-			Repaint();
-		}
-
-		private async void OnGUI()
-		{
-			if (!string.IsNullOrEmpty(repoId) && repoId != "dv.repo.xxxxx")
+			foreach (var obj in selected)
 			{
-				EditorGUILayout.LabelField("Repo ID (auto-filled):");
-				EditorGUILayout.SelectableLabel(repoId, EditorStyles.textField, GUILayout.Height(18));
+				string path = AssetDatabase.GetAssetPath(obj);
+				if (!string.IsNullOrEmpty(path) && !AssetDatabase.IsValidFolder(path))
+					selectedPaths.Add(path);
 			}
+		}
+		if (selectedPaths.Count == 0)
+		{
+			EditorUtility.DisplayDialog("Diversion Download", "No files selected.", "OK");
+			return;
+		}
+		string repoId = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionRepoIdKey), "");
+		string branchId = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionBranchRefKey), "dv.branch.1");
+		string accessToken = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionAccessTokenKey), "");
+		if (!string.IsNullOrEmpty(repoId) && !repoId.StartsWith("dv.repo."))
+			repoId = "dv.repo." + repoId;
+		if (!string.IsNullOrEmpty(branchId) && !branchId.StartsWith("dv.branch."))
+			branchId = "dv.branch." + branchId;
+		if (string.IsNullOrEmpty(accessToken))
+		{
+			EditorUtility.DisplayDialog("Diversion Download", "No access token found in EditorPrefs.", "OK");
+			return;
+		}
+		string tempDir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "DiversionDownload");
+		System.IO.Directory.CreateDirectory(tempDir);
+		int successCount = 0;
+		List<string> failedFiles = new List<string>();
+		foreach (var relPath in selectedPaths)
+		{
+			string outputPath = System.IO.Path.Combine(tempDir, System.IO.Path.GetFileName(relPath));
+			bool success = await DownloadDiversionFile(repoId, branchId, relPath, accessToken, outputPath);
+			if (success)
+				successCount++;
 			else
-			{
-				EditorGUILayout.LabelField("Repo ID:");
-				repoId = EditorGUILayout.TextField(repoId);
-			}
-			EditorGUILayout.LabelField("Branch ID:");
-			branchId = EditorGUILayout.TextField(branchId);
-			EditorGUILayout.LabelField("File Path (relative to repo root):");
-			relPath = EditorGUILayout.TextField(relPath);
-			if (!string.IsNullOrEmpty(workspaceId))
-			{
-				EditorGUILayout.LabelField("Workspace ID (auto-filled):");
-				EditorGUILayout.SelectableLabel(workspaceId, EditorStyles.textField, GUILayout.Height(18));
-			}
-			GUILayout.Space(10);
-			if (GUILayout.Button("Download"))
-			{
-				// Ensure prefixes before download
-				if (!string.IsNullOrEmpty(repoId) && !repoId.StartsWith("dv.repo."))
-					repoId = "dv.repo." + repoId;
-				if (!string.IsNullOrEmpty(branchId) && !branchId.StartsWith("dv.branch."))
-					branchId = "dv.branch." + branchId;
-				string accessToken = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionAccessTokenKey), "");
-				if (string.IsNullOrEmpty(accessToken))
-				{
-					status = "No access token found in EditorPrefs.";
-					Repaint();
-					return;
-				}
-				string tempDir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "DiversionDownload");
-				System.IO.Directory.CreateDirectory(tempDir);
-				string outputPath = System.IO.Path.Combine(tempDir, System.IO.Path.GetFileName(relPath));
-				bool success = await DownloadDiversionFile(repoId, branchId, relPath, accessToken, outputPath);
-				if (success)
-				{
-					status = $"Downloaded file to {outputPath}";
-					EditorUtility.RevealInFinder(outputPath);
-					Repaint();
-					return;
-				}
-				else
-				{
-					status = "Failed to download file from Diversion.";
-					Repaint();
-					return;
-				}
-			}
-			if (!string.IsNullOrEmpty(status))
-			{
-				GUILayout.Space(10);
-				EditorGUILayout.HelpBox(status, status.Contains("Failed") ? MessageType.Error : MessageType.Info);
-			}
+				failedFiles.Add(relPath);
 		}
+		if (successCount > 0)
+		{
+			EditorUtility.RevealInFinder(tempDir);
+		}
+		var window = ScriptableObject.CreateInstance<DiversionDownloadResultWindow>();
+		window.titleContent = new GUIContent("Diversion Download Results");
+		window.minSize = new Vector2(700, 340);
+		window.downloadedFiles = selectedPaths.Except(failedFiles).ToList();
+		window.failedFiles = failedFiles;
+		window.tempDir = tempDir;
+		window.ShowModalUtility();
 	}
 
 	public static async Task<bool> DownloadDiversionFile(string repoId, string branchId, string relPath, string accessToken, string outputPath)
 	{
-		string url = $"https://api.diversion.dev/v0/repos/{repoId}/blobs/{branchId}/{UnityWebRequest.EscapeURL(relPath)}";
+		string url = $"https://api.diversion.dev/v0/repos/{repoId}/blobs/{branchId}/{UnityWebRequest.EscapeURL(relPath).Replace("+", "%20")}";
 		using (UnityWebRequest req = UnityWebRequest.Get(url))
 		{
 			req.SetRequestHeader("Authorization", $"Bearer {accessToken}");
@@ -1356,7 +1316,7 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 		EditorGUILayout.Space();
 		GUILayout.BeginHorizontal();
 		GUILayout.Space(20); // Left margin
-		GUILayout.BeginVertical();
+		GUILayout.BeginVertical(GUIStyle.none);
 
 		EditorGUILayout.LabelField("Diversion Settings", EditorStyles.boldLabel);
 		EditorGUILayout.Space();
@@ -1538,8 +1498,139 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 		}
 
 		GUILayout.EndVertical();
-		GUILayout.Space(20); // Right margin
+		GUILayout.Space(8);
 		GUILayout.EndHorizontal();
+	}
+}
+
+public class DiversionDownloadResultWindow : EditorWindow
+{
+	public List<string> downloadedFiles;
+	public List<string> failedFiles;
+	public string tempDir;
+
+	public static void ShowResults(List<string> downloaded, List<string> failed, string tempDir)
+	{
+		var window = ScriptableObject.CreateInstance<DiversionDownloadResultWindow>();
+		window.titleContent = new GUIContent("Diversion Download Results");
+		window.minSize = new Vector2(700, 340);
+		window.downloadedFiles = downloaded.Except(failed).ToList();
+		window.failedFiles = failed;
+		window.tempDir = tempDir;
+		window.ShowModalUtility();
+	}
+
+	private void OnGUI()
+	{
+		// Set window background color to rgba(96, 96, 96, 0.2039216)
+		Color bgCol = new Color32(0x29, 0x29, 0x29, 0xFF); // #292929
+		Rect bgRect = new Rect(0, 0, position.width, position.height);
+		EditorGUI.DrawRect(bgRect, bgCol);
+
+		// Padding
+		GUILayout.BeginVertical();
+		GUILayout.Space(20);
+		GUILayout.BeginHorizontal();
+		GUILayout.Space(20);
+		GUILayout.BeginVertical();
+
+		// Use default Unity styles for all text except the button
+		EditorGUILayout.LabelField("Diversion Download Results", EditorStyles.boldLabel);
+		GUILayout.Space(20); // Extra margin below the icon/title
+		if (!string.IsNullOrEmpty(tempDir))
+		{
+			EditorGUILayout.BeginHorizontal();
+			EditorGUILayout.LabelField("Download Directory:", EditorStyles.label, GUILayout.Width(140));
+			if (GUILayout.Button(tempDir, EditorStyles.linkLabel))
+			{
+				EditorUtility.RevealInFinder(tempDir);
+			}
+			EditorGUILayout.EndHorizontal();
+		}
+		EditorGUILayout.Space();
+		EditorGUILayout.LabelField($"Downloaded Files ({downloadedFiles.Count}):", EditorStyles.boldLabel);
+		foreach (var file in downloadedFiles)
+		{
+			if (GUILayout.Button(file, EditorStyles.linkLabel))
+			{
+				var asset = AssetDatabase.LoadAssetAtPath<Object>(file);
+				if (asset != null)
+					EditorGUIUtility.PingObject(asset);
+				else
+				{
+					string tempFile = System.IO.Path.Combine(tempDir, System.IO.Path.GetFileName(file));
+					EditorUtility.RevealInFinder(tempFile);
+				}
+			}
+		}
+		if (failedFiles != null && failedFiles.Count > 0)
+		{
+			EditorGUILayout.Space();
+			EditorGUILayout.LabelField($"Failed to Download ({failedFiles.Count}):", EditorStyles.boldLabel);
+			foreach (var file in failedFiles)
+			{
+				EditorGUILayout.LabelField(file, EditorStyles.wordWrappedLabel);
+			}
+		}
+		EditorGUILayout.Space();
+		GUILayout.FlexibleSpace();
+		var okButtonStyle = new GUIStyle(GUI.skin.button);
+		okButtonStyle.normal.textColor = Color.white;
+		okButtonStyle.fontSize = 16;
+		okButtonStyle.fontStyle = FontStyle.Bold;
+		okButtonStyle.fixedHeight = 25;
+		Color okBlue = new Color32(0x3A, 0x79, 0xBB, 0xFF); // #3A79BB
+		okButtonStyle.normal.background = MakeRoundedTex(200, 25, okBlue, 5);
+		okButtonStyle.hover.background = MakeRoundedTex(200, 25, okBlue * 0.9f, 5);
+		okButtonStyle.border = new RectOffset(5, 5, 5, 5);
+		GUILayout.BeginHorizontal();
+		GUILayout.FlexibleSpace();
+		GUI.SetNextControlName("OKButton");
+		if (GUILayout.Button("OK", okButtonStyle, GUILayout.Width(200), GUILayout.Height(25)))
+		{
+			this.Close();
+		}
+		GUILayout.FlexibleSpace();
+		GUILayout.EndHorizontal();
+		GUILayout.Space(20);
+		if (Event.current.type == EventType.Repaint)
+		{
+			EditorGUI.FocusTextInControl("OKButton");
+		}
+		if (Event.current.type == EventType.KeyDown && (Event.current.keyCode == KeyCode.Return || Event.current.keyCode == KeyCode.KeypadEnter))
+		{
+			this.Close();
+			GUIUtility.ExitGUI();
+		}
+		GUILayout.EndVertical();
+	}
+
+	// Helper for blue button background
+	Texture2D MakeRoundedTex(int width, int height, Color col, int radius)
+	{
+		Texture2D tex = new Texture2D(width, height);
+		for (int y = 0; y < height; y++)
+		{
+			for (int x = 0; x < width; x++)
+			{
+				bool inside = (x >= radius && x < width - radius) || (y >= radius && y < height - radius);
+				if (!inside)
+				{
+					// Check distance to nearest corner
+					int dx = x < radius ? radius - x : x - (width - 1 - radius);
+					int dy = y < radius ? radius - y : y - (height - 1 - radius);
+					float dist = Mathf.Sqrt(dx * dx + dy * dy);
+					if (dist > radius)
+					{
+						tex.SetPixel(x, y, Color.clear);
+						continue;
+					}
+				}
+				tex.SetPixel(x, y, col);
+			}
+		}
+		tex.Apply();
+		return tex;
 	}
 }
 #endif
