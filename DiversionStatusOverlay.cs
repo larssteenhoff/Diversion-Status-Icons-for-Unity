@@ -34,14 +34,18 @@ public static class DiversionStatusOverlay
 	private static float refreshDelay = 1.0f; // default 1 second
 	private static int maxFilesSetting;
 
+	// Helper to get a project-specific key for EditorPrefs
+	public static string ProjectKeyPrefix => Application.dataPath.GetHashCode().ToString();
+	public static string ProjectScopedKey(string baseKey) => $"DiversionOverlay.{ProjectKeyPrefix}.{baseKey}";
+
 	static DiversionStatusOverlay()
 	{
 		LoadIcons();
 		EditorApplication.projectWindowItemOnGUI += OnProjectWindowItemGUI;
 		EditorApplication.update += OnEditorUpdate;
 		UpdateStatusAsync();
-		refreshDelay = EditorPrefs.GetFloat(DiversionRefreshDelayKey, 1.0f);
-		maxFilesSetting = EditorPrefs.GetInt(DiversionMaxFilesKey, 1000);
+		refreshDelay = EditorPrefs.GetFloat(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionRefreshDelayKey), 1.0f);
+		maxFilesSetting = EditorPrefs.GetInt(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionMaxFilesKey), 1000);
 		// On startup, if token is old, refresh it
 		CheckAndRefreshAccessTokenIfNeeded();
 		// Refresh status when Unity regains focus
@@ -87,9 +91,9 @@ public static class DiversionStatusOverlay
 				string accessToken = json["access_token"]?.Value<string>();
 				if (!string.IsNullOrEmpty(accessToken) && accessToken.Count(c => c == '.') == 2)
 				{
-					EditorPrefs.SetString(DiversionAccessTokenKey, accessToken);
+					EditorPrefs.SetString(ProjectScopedKey(DiversionStatusOverlay.DiversionAccessTokenKey), accessToken);
 					if (DebugLogsEnabled) Debug.Log("Diversion Overlay: Access token updated.");
-					EditorPrefs.SetFloat(DiversionAccessTokenLastRefreshKey, (float)EditorApplication.timeSinceStartup);
+					EditorPrefs.SetFloat(ProjectScopedKey(DiversionStatusOverlay.DiversionAccessTokenLastRefreshKey), (float)EditorApplication.timeSinceStartup);
 				}
 				else
 				{
@@ -105,9 +109,9 @@ public static class DiversionStatusOverlay
 
 	static async void UpdateStatusAsync()
 	{
-		string accessToken = EditorPrefs.GetString(DiversionAccessTokenKey, "");
-		string repoId = EditorPrefs.GetString(DiversionRepoIdKey, "");
-		string workspaceId = EditorPrefs.GetString(DiversionWorkspaceIdKey, "");
+		string accessToken = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionAccessTokenKey), "");
+		string repoId = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionRepoIdKey), "");
+		string workspaceId = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionWorkspaceIdKey), "");
 
 		// Ensure Diversion prefixes are present
 		if (!string.IsNullOrEmpty(repoId) && !repoId.StartsWith("dv.repo."))
@@ -121,7 +125,7 @@ public static class DiversionStatusOverlay
 			return;
 		}
 
-		int limit = EditorPrefs.GetInt(DiversionMaxFilesKey, 1000);
+		int limit = EditorPrefs.GetInt(ProjectScopedKey(DiversionStatusOverlay.DiversionMaxFilesKey), 1000);
 		int skip = 0;
 		bool more = true;
 		JObject combinedItems = new JObject();
@@ -305,12 +309,12 @@ public static class DiversionStatusOverlay
 
 	public static void FetchRepoAndWorkspaceIds()
 	{
-		string diversionCLIPath = EditorPrefs.GetString(DiversionCLIPathKey, "");
+		string diversionCLIPath = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionCLIPathKey), "");
 		if (string.IsNullOrEmpty(diversionCLIPath) || !System.IO.File.Exists(diversionCLIPath))
 		{
 			diversionCLIPath = AutoDetectDiversionCLIPath();
 			if (!string.IsNullOrEmpty(diversionCLIPath))
-				EditorPrefs.SetString(DiversionCLIPathKey, diversionCLIPath);
+				EditorPrefs.SetString(ProjectScopedKey(DiversionStatusOverlay.DiversionCLIPathKey), diversionCLIPath);
 		}
 		if (string.IsNullOrEmpty(diversionCLIPath) || !System.IO.File.Exists(diversionCLIPath))
 		{
@@ -361,8 +365,8 @@ public static class DiversionStatusOverlay
 				}
 				if (!string.IsNullOrEmpty(repoId) && !string.IsNullOrEmpty(workspaceId))
 				{
-					EditorPrefs.SetString(DiversionRepoIdKey, repoId);
-					EditorPrefs.SetString(DiversionWorkspaceIdKey, workspaceId);
+					EditorPrefs.SetString(ProjectScopedKey(DiversionStatusOverlay.DiversionRepoIdKey), repoId);
+					EditorPrefs.SetString(ProjectScopedKey(DiversionStatusOverlay.DiversionWorkspaceIdKey), workspaceId);
 					if (DiversionStatusOverlay.DebugLogsEnabled) Debug.Log($"Diversion Overlay: Auto-fetched Repo ID: {repoId}, Workspace ID: {workspaceId}");
 				}
 				else
@@ -477,9 +481,9 @@ public static class DiversionStatusOverlay
 		var selected = Selection.objects;
 		if (selected == null || selected.Length == 0) return;
 
-		string accessToken = EditorPrefs.GetString(DiversionAccessTokenKey, "");
-		string repoId = EditorPrefs.GetString(DiversionRepoIdKey, "");
-		string workspaceId = EditorPrefs.GetString(DiversionWorkspaceIdKey, "");
+		string accessToken = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionAccessTokenKey), "");
+		string repoId = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionRepoIdKey), "");
+		string workspaceId = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionWorkspaceIdKey), "");
 		if (!string.IsNullOrEmpty(repoId) && !repoId.StartsWith("dv.repo."))
 			repoId = "dv.repo." + repoId;
 		if (!string.IsNullOrEmpty(workspaceId) && !workspaceId.StartsWith("dv.ws."))
@@ -675,7 +679,7 @@ public static class DiversionStatusOverlay
 
 	static void OnEditorUpdate()
 	{
-		refreshDelay = EditorPrefs.GetFloat(DiversionRefreshDelayKey, 1.0f);
+		refreshDelay = EditorPrefs.GetFloat(ProjectScopedKey(DiversionStatusOverlay.DiversionRefreshDelayKey), 1.0f);
 		if (pendingRefresh && (EditorApplication.timeSinceStartup - lastAssetChangeTime > refreshDelay))
 		{
 			pendingRefresh = false;
@@ -687,15 +691,15 @@ public static class DiversionStatusOverlay
 
 	static void CheckAndRefreshAccessTokenIfNeeded()
 	{
-		double lastRefresh = EditorPrefs.GetFloat(DiversionAccessTokenLastRefreshKey, 0f);
+		double lastRefresh = EditorPrefs.GetFloat(ProjectScopedKey(DiversionStatusOverlay.DiversionAccessTokenLastRefreshKey), 0f);
 		double now = EditorApplication.timeSinceStartup;
 		if (now - lastRefresh > AccessTokenRefreshIntervalSeconds)
 		{
-			string refreshToken = EditorPrefs.GetString(DiversionRefreshTokenKey, "");
+			string refreshToken = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionRefreshTokenKey), "");
 			if (!string.IsNullOrEmpty(refreshToken))
 			{
 				_ = ExchangeRefreshTokenForAccessToken(refreshToken);
-				EditorPrefs.SetFloat(DiversionAccessTokenLastRefreshKey, (float)now);
+				EditorPrefs.SetFloat(ProjectScopedKey(DiversionStatusOverlay.DiversionAccessTokenLastRefreshKey), (float)now);
 			}
 		}
 	}
@@ -741,7 +745,7 @@ public static class DiversionStatusOverlay
 		}
 	}
 
-	public static bool DebugLogsEnabled => EditorPrefs.GetBool(DiversionDebugLogsKey, false);
+	public static bool DebugLogsEnabled => EditorPrefs.GetBool(ProjectScopedKey(DiversionStatusOverlay.DiversionDebugLogsKey), false);
 
 	[MenuItem("Assets/Diversion/Compare with Tracked in Meld", true, 2100)]
 	private static bool ValidateCompareWithTrackedInMeld()
@@ -868,21 +872,21 @@ public static class DiversionStatusOverlay
 		string path = AssetDatabase.GetAssetPath(selected);
 		if (string.IsNullOrEmpty(path)) return;
 
-		string accessToken = EditorPrefs.GetString(DiversionAccessTokenKey, "");
+		string accessToken = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionAccessTokenKey), "");
 		string apiBase = GetAgentApiBaseUrl(); // always cloud for downloads
 		string repoId = null, workspaceId = null, branchId = null;
 		(repoId, workspaceId, branchId) = await GetWorkspaceConfigForPath(path);
 		if (string.IsNullOrEmpty(repoId))
 		{
-			repoId = EditorPrefs.GetString(DiversionRepoIdKey, "");
+			repoId = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionRepoIdKey), "");
 		}
 		if (string.IsNullOrEmpty(workspaceId))
 		{
-			workspaceId = EditorPrefs.GetString(DiversionWorkspaceIdKey, "");
+			workspaceId = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionWorkspaceIdKey), "");
 		}
 		if (string.IsNullOrEmpty(branchId))
 		{
-			branchId = EditorPrefs.GetString(DiversionBranchRefKey, "dv.branch.1");
+			branchId = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionBranchRefKey), "dv.branch.1");
 		}
 		// Ensure prefixes
 		if (!string.IsNullOrEmpty(repoId) && !repoId.StartsWith("dv.repo."))
@@ -901,7 +905,7 @@ public static class DiversionStatusOverlay
 			return;
 		}
 
-		string meldPath = EditorPrefs.GetString(DiversionMeldPathKey, "/Applications/Meld.app/Contents/MacOS/Meld");
+		string meldPath = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionMeldPathKey), "/Applications/Meld.app/Contents/MacOS/Meld");
 		if (!System.IO.File.Exists(meldPath))
 		{
 			EditorUtility.DisplayDialog("Meld Not Found", $"Meld was not found at: {meldPath}\nPlease set the correct path in Diversion Project Settings.", "OK");
@@ -1076,8 +1080,8 @@ public static class DiversionStatusOverlay
 		{
 			DiversionStatusOverlay.FetchRepoAndWorkspaceIds();
 			await System.Threading.Tasks.Task.Delay(200); // Give CLI a moment to finish (not perfect, but avoids race)
-			repoId = EditorPrefs.GetString(DiversionStatusOverlay.DiversionRepoIdKey, repoId);
-			workspaceId = EditorPrefs.GetString(DiversionStatusOverlay.DiversionWorkspaceIdKey, workspaceId);
+			repoId = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionRepoIdKey), repoId);
+			workspaceId = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionWorkspaceIdKey), workspaceId);
 			if (!string.IsNullOrEmpty(repoId) && !repoId.StartsWith("dv.repo."))
 				repoId = "dv.repo." + repoId;
 			if (!string.IsNullOrEmpty(workspaceId) && !workspaceId.StartsWith("dv.ws."))
@@ -1116,7 +1120,7 @@ public static class DiversionStatusOverlay
 					repoId = "dv.repo." + repoId;
 				if (!string.IsNullOrEmpty(branchId) && !branchId.StartsWith("dv.branch."))
 					branchId = "dv.branch." + branchId;
-				string accessToken = EditorPrefs.GetString(DiversionAccessTokenKey, "");
+				string accessToken = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionAccessTokenKey), "");
 				if (string.IsNullOrEmpty(accessToken))
 				{
 					status = "No access token found in EditorPrefs.";
@@ -1213,21 +1217,21 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 
 	private void ReloadFields()
 	{
-		refreshToken = EditorPrefs.GetString(DiversionStatusOverlay.DiversionRefreshTokenKey, "");
-		accessToken = EditorPrefs.GetString(DiversionStatusOverlay.DiversionAccessTokenKey, "");
-		apiKey = EditorPrefs.GetString(DiversionStatusOverlay.DiversionAPIKey, "");
-		repoId = EditorPrefs.GetString(DiversionStatusOverlay.DiversionRepoIdKey, "");
+		refreshToken = EditorPrefs.GetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionRefreshTokenKey), "");
+		accessToken = EditorPrefs.GetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionAccessTokenKey), "");
+		apiKey = EditorPrefs.GetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionAPIKey), "");
+		repoId = EditorPrefs.GetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionRepoIdKey), "");
 		if (!string.IsNullOrEmpty(repoId) && !repoId.StartsWith("dv.repo."))
 			repoId = "dv.repo." + repoId;
-		workspaceId = EditorPrefs.GetString(DiversionStatusOverlay.DiversionWorkspaceIdKey, "");
+		workspaceId = EditorPrefs.GetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionWorkspaceIdKey), "");
 		if (!string.IsNullOrEmpty(workspaceId) && !workspaceId.StartsWith("dv.ws."))
 			workspaceId = "dv.ws." + workspaceId;
-		cliPath = EditorPrefs.GetString(DiversionStatusOverlay.DiversionCLIPathKey, "");
+		cliPath = EditorPrefs.GetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionCLIPathKey), "");
 		if (string.IsNullOrEmpty(cliPath) || !System.IO.File.Exists(cliPath))
 			cliPath = DiversionStatusOverlay.AutoDetectDiversionCLIPath() ?? "";
 		if (!string.IsNullOrEmpty(cliPath))
-			EditorPrefs.SetString(DiversionStatusOverlay.DiversionCLIPathKey, cliPath);
-		maxFilesSetting = EditorPrefs.GetInt(DiversionStatusOverlay.DiversionMaxFilesKey, 1000);
+			EditorPrefs.SetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionCLIPathKey), cliPath);
+		maxFilesSetting = EditorPrefs.GetInt(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionMaxFilesKey), 1000);
 	}
 
 	public override void OnGUI(string searchContext)
@@ -1248,7 +1252,7 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 		{
 			cliPath = DiversionStatusOverlay.AutoDetectDiversionCLIPath() ?? "";
 			if (!string.IsNullOrEmpty(cliPath))
-				EditorPrefs.SetString(DiversionStatusOverlay.DiversionCLIPathKey, cliPath);
+				EditorPrefs.SetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionCLIPathKey), cliPath);
 			ReloadFields();
 		}
 		EditorGUILayout.Space();
@@ -1270,7 +1274,7 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 
 		EditorGUILayout.Space();
 		EditorGUILayout.LabelField("Access Token (read-only):");
-		EditorGUILayout.SelectableLabel(EditorPrefs.GetString(DiversionStatusOverlay.DiversionAccessTokenKey, ""), EditorStyles.textField, GUILayout.Height(40));
+		EditorGUILayout.SelectableLabel(EditorPrefs.GetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionAccessTokenKey), ""), EditorStyles.textField, GUILayout.Height(40));
 
 		EditorGUILayout.Space();
 		if (GUILayout.Button("Refresh Access Token"))
@@ -1288,11 +1292,11 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 		EditorGUILayout.Space();
 		EditorGUILayout.LabelField("Status Refresh Delay After Change (seconds)");
 		EditorGUI.BeginChangeCheck();
-		float delaySetting = EditorPrefs.GetFloat(DiversionStatusOverlay.DiversionRefreshDelayKey, 1.0f);
+		float delaySetting = EditorPrefs.GetFloat(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionRefreshDelayKey), 1.0f);
 		delaySetting = EditorGUILayout.Slider(delaySetting, 0.1f, 10.0f);
 		if (EditorGUI.EndChangeCheck())
 		{
-			EditorPrefs.SetFloat(DiversionStatusOverlay.DiversionRefreshDelayKey, delaySetting);
+			EditorPrefs.SetFloat(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionRefreshDelayKey), delaySetting);
 		}
 
 		EditorGUILayout.Space();
@@ -1301,7 +1305,7 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 		maxFilesSetting = EditorGUILayout.IntSlider(maxFilesSetting, 100, 5000);
 		if (EditorGUI.EndChangeCheck())
 		{
-			EditorPrefs.SetInt(DiversionStatusOverlay.DiversionMaxFilesKey, maxFilesSetting);
+			EditorPrefs.SetInt(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionMaxFilesKey), maxFilesSetting);
 		}
 
 		EditorGUILayout.Space();
@@ -1340,20 +1344,20 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 		}
 
 		EditorGUILayout.Space();
-		bool debugLogs = EditorPrefs.GetBool(DiversionStatusOverlay.DiversionDebugLogsKey, false);
+		bool debugLogs = EditorPrefs.GetBool(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionDebugLogsKey), false);
 		bool newDebugLogs = EditorGUILayout.Toggle("Enable Debug Logs", debugLogs);
 		if (newDebugLogs != debugLogs)
 		{
-			EditorPrefs.SetBool(DiversionStatusOverlay.DiversionDebugLogsKey, newDebugLogs);
+			EditorPrefs.SetBool(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionDebugLogsKey), newDebugLogs);
 		}
 
 		EditorGUILayout.Space();
 		EditorGUILayout.LabelField("Meld Diff Tool Path");
-		string meldPathSetting = EditorPrefs.GetString(DiversionStatusOverlay.DiversionMeldPathKey, "/Applications/Meld.app/Contents/MacOS/Meld");
+		string meldPathSetting = EditorPrefs.GetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionMeldPathKey), "/Applications/Meld.app/Contents/MacOS/Meld");
 		string newMeldPath = EditorGUILayout.TextField(meldPathSetting);
 		if (newMeldPath != meldPathSetting)
 		{
-			EditorPrefs.SetString(DiversionStatusOverlay.DiversionMeldPathKey, newMeldPath);
+			EditorPrefs.SetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionMeldPathKey), newMeldPath);
 		}
 
 		GUILayout.EndVertical();
