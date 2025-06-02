@@ -25,6 +25,8 @@ public static class DiversionStatusOverlay
 	public const string DiversionMaxFilesKey = "DiversionOverlay.MaxFiles";
 	public const string DiversionAccessTokenLastRefreshKey = "DiversionOverlay.AccessTokenLastRefresh";
 	public const string DiversionDebugLogsKey = "DiversionOverlay.DebugLogs";
+	public const string DiversionMeldPathKey = "DiversionOverlay.MeldPath";
+	public const string DiversionBranchRefKey = "DiversionOverlay.BranchRef";
 	private const double AccessTokenRefreshIntervalSeconds = 59 * 60; // 59 minutes
 
 	private static bool pendingRefresh = false;
@@ -740,6 +742,448 @@ public static class DiversionStatusOverlay
 	}
 
 	public static bool DebugLogsEnabled => EditorPrefs.GetBool(DiversionDebugLogsKey, false);
+
+	[MenuItem("Assets/Diversion/Compare with Tracked in Meld", true, 2100)]
+	private static bool ValidateCompareWithTrackedInMeld()
+	{
+		var selected = Selection.activeObject;
+		if (selected == null) return false;
+		string path = AssetDatabase.GetAssetPath(selected);
+		return !string.IsNullOrEmpty(path) && (System.IO.File.Exists(path) || AssetDatabase.IsValidFolder(path));
+	}
+
+	// Helper to get Diversion agent port from ~/.diversion/.port
+	private static string GetDiversionAgentPort()
+	{
+		string homeDir = System.Environment.GetFolderPath(System.Environment.SpecialFolder.UserProfile);
+		string portFile = System.IO.Path.Combine(homeDir, ".diversion", ".port");
+		if (System.IO.File.Exists(portFile))
+		{
+			string portStr = System.IO.File.ReadAllText(portFile).Trim();
+			if (int.TryParse(portStr, out int port))
+				return portStr;
+		}
+		return null;
+	}
+
+	// Helper to get agent API base URL, or null if not available
+	private static string GetAgentApiBaseUrl()
+	{
+		string port = GetDiversionAgentPort();
+		if (!string.IsNullOrEmpty(port))
+			return $"http://localhost:{port}";
+		return null;
+	}
+
+	// Helper to get workspace config for a given path using the agent, now returns branch id (e.g., dv.branch.1)
+	private static async Task<(string repoId, string workspaceId, string branchId)> GetWorkspaceConfigForPath(string assetPath)
+	{
+		string apiBase = GetAgentApiBaseUrl();
+		if (string.IsNullOrEmpty(apiBase))
+		{
+			Debug.LogError("Diversion Overlay: Diversion agent is not running or not found. Please start the Diversion agent.");
+			EditorUtility.DisplayDialog("Diversion Agent Not Found", "Diversion agent is not running or not found. Please start the Diversion agent.", "OK");
+			return (null, null, null);
+		}
+		string repoRoot = FindRepoRoot(assetPath);
+		if (repoRoot == null)
+			return (null, null, null);
+		if (DebugLogsEnabled) Debug.Log($"Diversion Overlay: Looking up workspace config for repoRoot={repoRoot}, abs_path={UnityWebRequest.EscapeURL(repoRoot)}");
+		string url = $"{apiBase}/v0/workspaces/by-path?abs_path={UnityWebRequest.EscapeURL(repoRoot)}";
+		using (UnityWebRequest req = UnityWebRequest.Get(url))
+		{
+			await req.SendWebRequest();
+			if (req.result == UnityWebRequest.Result.Success)
+			{
+				var json = JObject.Parse(req.downloadHandler.text);
+				if (DebugLogsEnabled) Debug.Log($"Diversion Overlay: Workspace config JSON: {json}");
+				if (DebugLogsEnabled && json != null)
+				{
+					Debug.Log("Diversion Overlay: Workspace config JSON keys: " + string.Join(", ", json.Properties().Select(p => p.Name)));
+				}
+				if (json != null && json.HasValues)
+				{
+					string repoId = json["repo_id"]?.ToString() ?? json["RepoID"]?.ToString();
+					string workspaceId = json["workspace_id"]?.ToString() ?? json["WorkspaceID"]?.ToString();
+					string branchId = json["branch_id"]?.ToString() ?? json["BranchID"]?.ToString();
+					string branch = json["branch"]?.ToString() ?? json["BranchName"]?.ToString();
+					string refField = json["ref"]?.ToString() ?? json["CommitID"]?.ToString();
+					if (DebugLogsEnabled)
+					{
+						Debug.Log($"Diversion Overlay: branch_id={branchId}, branch={branch}, ref={refField}");
+					}
+					branchId = branchId ?? branch ?? refField;
+					if (string.IsNullOrEmpty(branchId))
+					{
+						Debug.LogError("Diversion Overlay: No branch_id, branch, or ref found in workspace config. Cannot proceed.");
+						return (repoId, workspaceId, null);
+					}
+					if (DebugLogsEnabled) Debug.Log($"Diversion Overlay: Using branchId={branchId}");
+					return (repoId, workspaceId, branchId);
+				}
+			}
+		}
+		return (null, null, null);
+	}
+
+	// Helper to fetch commit history for a file, refId can be branch or commit
+	private static async Task<List<(string id, string message)>> GetFileCommitHistory(string repoId, string refId, string relPath, string accessToken)
+	{
+		var commits = new List<(string, string)>();
+		string url = $"https://api.diversion.dev/v0/repos/{repoId}/object-history/{refId}/{UnityWebRequest.EscapeURL(relPath)}";
+		if (DebugLogsEnabled)
+			Debug.Log($"Diversion Overlay: Commit history API: {url}");
+		using (UnityWebRequest req = UnityWebRequest.Get(url))
+		{
+			req.SetRequestHeader("Authorization", $"Bearer {accessToken}");
+			await req.SendWebRequest();
+			if (req.result == UnityWebRequest.Result.Success)
+			{
+				var json = JObject.Parse(req.downloadHandler.text);
+				foreach (var entry in json["entries"] ?? new JArray())
+				{
+					string commitId = entry["commit_id"]?.ToString();
+					string msg = entry["commit_message"]?.ToString();
+					commits.Add((commitId, msg));
+				}
+			}
+		}
+		return commits;
+	}
+
+	// Show a popup to select a commit from history
+	private static int ShowCommitSelectionPopup(List<(string id, string message)> commits)
+	{
+		int selected = 0;
+		string[] options = commits.Select(c => $"{c.id}: {c.message}").ToArray();
+		selected = EditorUtility.DisplayDialogComplex("Select Commit to Diff Against", "Choose a commit:", options.Length > 0 ? options[0] : "", options.Length > 1 ? options[1] : "", "Cancel");
+		return selected;
+	}
+
+	[MenuItem("Assets/Diversion/Compare with Tracked in Meld", false, 2100)]
+	public static async void CompareWithTrackedInMeld()
+	{
+		var selected = Selection.activeObject;
+		if (selected == null) return;
+		string path = AssetDatabase.GetAssetPath(selected);
+		if (string.IsNullOrEmpty(path)) return;
+
+		string accessToken = EditorPrefs.GetString(DiversionAccessTokenKey, "");
+		string apiBase = GetAgentApiBaseUrl(); // always cloud for downloads
+		string repoId = null, workspaceId = null, branchId = null;
+		(repoId, workspaceId, branchId) = await GetWorkspaceConfigForPath(path);
+		if (string.IsNullOrEmpty(repoId))
+		{
+			repoId = EditorPrefs.GetString(DiversionRepoIdKey, "");
+		}
+		if (string.IsNullOrEmpty(workspaceId))
+		{
+			workspaceId = EditorPrefs.GetString(DiversionWorkspaceIdKey, "");
+		}
+		if (string.IsNullOrEmpty(branchId))
+		{
+			branchId = EditorPrefs.GetString(DiversionBranchRefKey, "dv.branch.1");
+		}
+		// Ensure prefixes
+		if (!string.IsNullOrEmpty(repoId) && !repoId.StartsWith("dv.repo."))
+			repoId = "dv.repo." + repoId;
+		if (!string.IsNullOrEmpty(workspaceId) && !workspaceId.StartsWith("dv.ws."))
+			workspaceId = "dv.ws." + workspaceId;
+		if (!string.IsNullOrEmpty(branchId) && !branchId.StartsWith("dv.branch."))
+			branchId = "dv.branch." + branchId;
+		if (string.IsNullOrEmpty(repoId) || string.IsNullOrEmpty(workspaceId) || string.IsNullOrEmpty(branchId) || string.IsNullOrEmpty(accessToken))
+		{
+			if (DebugLogsEnabled)
+			{
+				Debug.LogError($"Diversion Overlay: accessToken={accessToken}, repoId={repoId}, workspaceId={workspaceId}, branchId={branchId}");
+			}
+			EditorUtility.DisplayDialog("Diversion API Error", "Missing access token, repo ID, workspace ID, or branch ID.", "OK");
+			return;
+		}
+
+		string meldPath = EditorPrefs.GetString(DiversionMeldPathKey, "/Applications/Meld.app/Contents/MacOS/Meld");
+		if (!System.IO.File.Exists(meldPath))
+		{
+			EditorUtility.DisplayDialog("Meld Not Found", $"Meld was not found at: {meldPath}\nPlease set the correct path in Diversion Project Settings.", "OK");
+			return;
+		}
+
+		if (AssetDatabase.IsValidFolder(path))
+		{
+			EditorUtility.DisplayDialog("Not Supported", "Folder diff is not supported yet with the Diversion API integration.", "OK");
+			return;
+		}
+
+		// Find repo root and get relative path
+		string repoRoot = FindRepoRoot(path);
+		if (repoRoot == null)
+		{
+			EditorUtility.DisplayDialog("Diversion Error", "Could not find Diversion repo root for this file.", "OK");
+			return;
+		}
+		string relPath = ToRelativePath(path, repoRoot);
+
+		// Download the latest tracked version from the branch
+		string tempDir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "DiversionCompare");
+		System.IO.Directory.CreateDirectory(tempDir);
+		string tempPath = System.IO.Path.Combine(tempDir, System.IO.Path.GetFileName(path));
+
+		bool success = await DownloadBlob(repoId, branchId, relPath, accessToken, tempPath);
+		if (!success)
+		{
+			EditorUtility.DisplayDialog("Download Failed", $"Failed to download file for comparison from Diversion.", "OK");
+			return;
+		}
+
+		// Launch Meld
+		var meldPsi = new System.Diagnostics.ProcessStartInfo
+		{
+			FileName = meldPath,
+			Arguments = $"\"{System.IO.Path.GetFullPath(path)}\" \"{tempPath}\"",
+			UseShellExecute = false,
+			CreateNoWindow = true
+		};
+		System.Diagnostics.Process.Start(meldPsi);
+
+		if (DebugLogsEnabled)
+		{
+			Debug.Log($"Diversion Compare: Downloaded and diffed {relPath}");
+		}
+	}
+
+	// Helper to download a blob (file at a specific ref)
+	private static async Task<bool> DownloadBlob(string repoId, string refId, string relPath, string accessToken, string outputPath)
+	{
+		string url = $"https://api.diversion.dev/v0/repos/{repoId}/blobs/{refId}/{UnityWebRequest.EscapeURL(relPath)}";
+		using (UnityWebRequest req = UnityWebRequest.Get(url))
+		{
+			req.SetRequestHeader("Authorization", $"Bearer {accessToken}");
+			await req.SendWebRequest();
+
+			// Direct download
+			if (req.responseCode == 200)
+			{
+				System.IO.File.WriteAllBytes(outputPath, req.downloadHandler.data);
+				if (DebugLogsEnabled) Debug.Log($"Downloaded {relPath} from {repoId} at {refId}");
+				return true;
+			}
+			// Diversion's redirect via 204 + Location
+			else if (req.responseCode == 204)
+			{
+				string redirectUrl = req.GetResponseHeader("Location");
+				if (!string.IsNullOrEmpty(redirectUrl))
+				{
+					using (UnityWebRequest redirectReq = UnityWebRequest.Get(redirectUrl))
+					{
+						await redirectReq.SendWebRequest();
+						if (redirectReq.responseCode == 200)
+						{
+							System.IO.File.WriteAllBytes(outputPath, redirectReq.downloadHandler.data);
+							if (DebugLogsEnabled) Debug.Log($"Downloaded {relPath} from redirector link");
+							return true;
+						}
+						else
+						{
+							Debug.LogError($"Failed to download from redirector: {redirectReq.responseCode} - {redirectReq.error}");
+						}
+					}
+				}
+				else
+				{
+					Debug.LogError("No redirect URL found in response headers.");
+				}
+			}
+			// Fallback for HTTP 3xx (just in case)
+			else if (req.responseCode >= 300 && req.responseCode < 400)
+			{
+				string redirectUrl = req.GetResponseHeader("Location");
+				if (!string.IsNullOrEmpty(redirectUrl))
+				{
+					using (UnityWebRequest redirectReq = UnityWebRequest.Get(redirectUrl))
+					{
+						await redirectReq.SendWebRequest();
+						if (redirectReq.responseCode == 200)
+						{
+							System.IO.File.WriteAllBytes(outputPath, redirectReq.downloadHandler.data);
+							if (DebugLogsEnabled) Debug.Log($"Downloaded {relPath} from HTTP 3xx redirect");
+							return true;
+						}
+						else
+						{
+							Debug.LogError($"Failed to download from HTTP 3xx redirect: {redirectReq.responseCode} - {redirectReq.error}");
+						}
+					}
+				}
+				else
+				{
+					Debug.LogError("No redirect URL found in 3xx response headers.");
+				}
+			}
+			else
+			{
+				Debug.LogError($"Failed to download {relPath}: {req.responseCode} - {req.error}\n{req.downloadHandler.text}");
+			}
+		}
+		return false;
+	}
+
+	// Helper to find repo root by searching for .diversion folder
+	private static string FindRepoRoot(string assetPath)
+	{
+		string fullPath = System.IO.Path.GetFullPath(assetPath);
+		string dir = System.IO.Path.GetDirectoryName(fullPath);
+		while (!string.IsNullOrEmpty(dir) && dir != System.IO.Path.GetPathRoot(dir))
+		{
+			if (System.IO.Directory.Exists(System.IO.Path.Combine(dir, ".diversion")))
+				return dir;
+			dir = System.IO.Path.GetDirectoryName(dir);
+		}
+		return null;
+	}
+
+	// Helper to get path relative to repo root
+	private static string ToRelativePath(string assetPath, string repoRoot)
+	{
+		string fullPath = System.IO.Path.GetFullPath(assetPath).Replace("\\", "/");
+		string repoRootNorm = repoRoot.Replace("\\", "/");
+		if (fullPath.StartsWith(repoRootNorm))
+			return fullPath.Substring(repoRootNorm.Length).TrimStart('/');
+		return assetPath;
+	}
+
+	[MenuItem("Assets/Diversion/Download Latest From Diversion", false, 2150)]
+	public static void ShowDownloadLatestFromDiversionWindow()
+	{
+		DiversionDownloadWindow.ShowWindow();
+	}
+
+	public class DiversionDownloadWindow : EditorWindow
+	{
+		private string repoId = "dv.repo.xxxxx";
+		private string branchId = "dv.branch.1";
+		private string relPath = "Assets/Diversion/Editor/DiversionStatusOverlay.cs";
+		private string workspaceId = "";
+		private string status = "";
+
+		public static void ShowWindow()
+		{
+			var window = GetWindow<DiversionDownloadWindow>(true, "Download from Diversion");
+			window.minSize = new Vector2(400, 220);
+			window.InitWorkspaceId();
+		}
+
+		private async void InitWorkspaceId()
+		{
+			DiversionStatusOverlay.FetchRepoAndWorkspaceIds();
+			await System.Threading.Tasks.Task.Delay(200); // Give CLI a moment to finish (not perfect, but avoids race)
+			repoId = EditorPrefs.GetString(DiversionStatusOverlay.DiversionRepoIdKey, repoId);
+			workspaceId = EditorPrefs.GetString(DiversionStatusOverlay.DiversionWorkspaceIdKey, workspaceId);
+			if (!string.IsNullOrEmpty(repoId) && !repoId.StartsWith("dv.repo."))
+				repoId = "dv.repo." + repoId;
+			if (!string.IsNullOrEmpty(workspaceId) && !workspaceId.StartsWith("dv.ws."))
+				workspaceId = "dv.ws." + workspaceId;
+			if (!string.IsNullOrEmpty(branchId) && !branchId.StartsWith("dv.branch."))
+				branchId = "dv.branch." + branchId;
+			Repaint();
+		}
+
+		private async void OnGUI()
+		{
+			if (!string.IsNullOrEmpty(repoId) && repoId != "dv.repo.xxxxx")
+			{
+				EditorGUILayout.LabelField("Repo ID (auto-filled):");
+				EditorGUILayout.SelectableLabel(repoId, EditorStyles.textField, GUILayout.Height(18));
+			}
+			else
+			{
+				EditorGUILayout.LabelField("Repo ID:");
+				repoId = EditorGUILayout.TextField(repoId);
+			}
+			EditorGUILayout.LabelField("Branch ID:");
+			branchId = EditorGUILayout.TextField(branchId);
+			EditorGUILayout.LabelField("File Path (relative to repo root):");
+			relPath = EditorGUILayout.TextField(relPath);
+			if (!string.IsNullOrEmpty(workspaceId))
+			{
+				EditorGUILayout.LabelField("Workspace ID (auto-filled):");
+				EditorGUILayout.SelectableLabel(workspaceId, EditorStyles.textField, GUILayout.Height(18));
+			}
+			GUILayout.Space(10);
+			if (GUILayout.Button("Download"))
+			{
+				// Ensure prefixes before download
+				if (!string.IsNullOrEmpty(repoId) && !repoId.StartsWith("dv.repo."))
+					repoId = "dv.repo." + repoId;
+				if (!string.IsNullOrEmpty(branchId) && !branchId.StartsWith("dv.branch."))
+					branchId = "dv.branch." + branchId;
+				string accessToken = EditorPrefs.GetString(DiversionAccessTokenKey, "");
+				if (string.IsNullOrEmpty(accessToken))
+				{
+					status = "No access token found in EditorPrefs.";
+					Repaint();
+					return;
+				}
+				string tempDir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "DiversionDownload");
+				System.IO.Directory.CreateDirectory(tempDir);
+				string outputPath = System.IO.Path.Combine(tempDir, System.IO.Path.GetFileName(relPath));
+				bool success = await DownloadDiversionFile(repoId, branchId, relPath, accessToken, outputPath);
+				if (success)
+				{
+					status = $"Downloaded file to {outputPath}";
+					EditorUtility.RevealInFinder(outputPath);
+					Repaint();
+					return;
+				}
+				else
+				{
+					status = "Failed to download file from Diversion.";
+					Repaint();
+					return;
+				}
+			}
+			if (!string.IsNullOrEmpty(status))
+			{
+				GUILayout.Space(10);
+				EditorGUILayout.HelpBox(status, status.Contains("Failed") ? MessageType.Error : MessageType.Info);
+			}
+		}
+	}
+
+	public static async Task<bool> DownloadDiversionFile(string repoId, string branchId, string relPath, string accessToken, string outputPath)
+	{
+		string url = $"https://api.diversion.dev/v0/repos/{repoId}/blobs/{branchId}/{UnityWebRequest.EscapeURL(relPath)}";
+		using (UnityWebRequest req = UnityWebRequest.Get(url))
+		{
+			req.SetRequestHeader("Authorization", $"Bearer {accessToken}");
+			await req.SendWebRequest();
+
+			if (req.responseCode == 200)
+			{
+				System.IO.File.WriteAllBytes(outputPath, req.downloadHandler.data);
+				Debug.Log($"Downloaded {relPath} from {repoId} at {branchId}");
+				return true;
+			}
+			else if (req.responseCode == 204)
+			{
+				string redirectUrl = req.GetResponseHeader("Location");
+				if (!string.IsNullOrEmpty(redirectUrl))
+				{
+					using (UnityWebRequest redirectReq = UnityWebRequest.Get(redirectUrl))
+					{
+						await redirectReq.SendWebRequest();
+						if (redirectReq.responseCode == 200)
+						{
+							System.IO.File.WriteAllBytes(outputPath, redirectReq.downloadHandler.data);
+							Debug.Log($"Downloaded {relPath} from redirector link");
+							return true;
+						}
+					}
+				}
+			}
+			Debug.LogError($"Failed to download {relPath}: {req.responseCode} - {req.error}\n{req.downloadHandler.text}");
+		}
+		return false;
+	}
 }
 
 public class DiversionOverlaySettingsProvider : SettingsProvider
@@ -901,6 +1345,15 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 		if (newDebugLogs != debugLogs)
 		{
 			EditorPrefs.SetBool(DiversionStatusOverlay.DiversionDebugLogsKey, newDebugLogs);
+		}
+
+		EditorGUILayout.Space();
+		EditorGUILayout.LabelField("Meld Diff Tool Path");
+		string meldPathSetting = EditorPrefs.GetString(DiversionStatusOverlay.DiversionMeldPathKey, "/Applications/Meld.app/Contents/MacOS/Meld");
+		string newMeldPath = EditorGUILayout.TextField(meldPathSetting);
+		if (newMeldPath != meldPathSetting)
+		{
+			EditorPrefs.SetString(DiversionStatusOverlay.DiversionMeldPathKey, newMeldPath);
 		}
 
 		GUILayout.EndVertical();
