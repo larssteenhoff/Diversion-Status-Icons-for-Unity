@@ -580,6 +580,11 @@ public static class DiversionStatusOverlay
 		if (selected == null || selected.Length == 0) return;
 
 		string accessToken = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionAccessTokenKey), "");
+		if (string.IsNullOrEmpty(accessToken))
+		{
+			EditorUtility.DisplayDialog("Diversion Reset", "Missing access token, repo ID, or workspace ID. Please enter your Diversion token in the settings before using this feature.", "OK");
+			return;
+		}
 		string repoId = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionRepoIdKey), "");
 		string workspaceId = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionWorkspaceIdKey), "");
 		if (!string.IsNullOrEmpty(repoId) && !repoId.StartsWith("dv.repo."))
@@ -893,8 +898,8 @@ public static class DiversionStatusOverlay
 		string apiBase = GetAgentApiBaseUrl();
 		if (string.IsNullOrEmpty(apiBase))
 		{
-			Debug.LogError("Diversion Overlay: Diversion agent is not running or not found. Please start the Diversion agent.");
-			EditorUtility.DisplayDialog("Diversion Agent Not Found", "Diversion agent is not running or not found. Please start the Diversion agent.", "OK");
+			Debug.LogError("Diversion Overlay: No access token found in EditorPrefs. Please enter your Diversion token in the settings before using this feature.");
+			EditorUtility.DisplayDialog("Diversion Agent Not Found", "No access token found in EditorPrefs. Please enter your Diversion token in the settings before using this feature.", "OK");
 			return (null, null, null);
 		}
 		string repoRoot = FindRepoRoot(assetPath);
@@ -981,6 +986,11 @@ public static class DiversionStatusOverlay
 		if (string.IsNullOrEmpty(path)) return;
 
 		string accessToken = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionAccessTokenKey), "");
+		if (string.IsNullOrEmpty(accessToken))
+		{
+			EditorUtility.DisplayDialog("Diversion API Error", "No access token found in EditorPrefs. Please enter your Diversion token in the settings before using this feature.", "OK");
+			return;
+		}
 		string apiBase = GetAgentApiBaseUrl(); // always cloud for downloads
 		string repoId = null, workspaceId = null, branchId = null;
 		(repoId, workspaceId, branchId) = await GetWorkspaceConfigForPath(path);
@@ -1003,7 +1013,7 @@ public static class DiversionStatusOverlay
 			workspaceId = "dv.ws." + workspaceId;
 		if (!string.IsNullOrEmpty(branchId) && !branchId.StartsWith("dv.branch."))
 			branchId = "dv.branch." + branchId;
-		if (string.IsNullOrEmpty(repoId) || string.IsNullOrEmpty(workspaceId) || string.IsNullOrEmpty(branchId) || string.IsNullOrEmpty(accessToken))
+		if (string.IsNullOrEmpty(repoId) || string.IsNullOrEmpty(workspaceId) || string.IsNullOrEmpty(branchId))
 		{
 			if (DebugLogsEnabled)
 			{
@@ -1182,15 +1192,15 @@ public static class DiversionStatusOverlay
 		string repoId = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionRepoIdKey), "");
 		string branchId = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionBranchRefKey), "dv.branch.1");
 		string accessToken = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionAccessTokenKey), "");
+		if (string.IsNullOrEmpty(accessToken))
+		{
+			EditorUtility.DisplayDialog("Diversion Download", "No access token found in EditorPrefs. Please enter your Diversion token in the settings before using this feature.", "OK");
+			return;
+		}
 		if (!string.IsNullOrEmpty(repoId) && !repoId.StartsWith("dv.repo."))
 			repoId = "dv.repo." + repoId;
 		if (!string.IsNullOrEmpty(branchId) && !branchId.StartsWith("dv.branch."))
 			branchId = "dv.branch." + branchId;
-		if (string.IsNullOrEmpty(accessToken))
-		{
-			EditorUtility.DisplayDialog("Diversion Download", "No access token found in EditorPrefs.", "OK");
-			return;
-		}
 		string tempDir = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "DiversionDownload");
 		System.IO.Directory.CreateDirectory(tempDir);
 		int successCount = 0;
@@ -1334,7 +1344,7 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 		EditorGUILayout.Space();
 
 		EditorGUI.BeginChangeCheck();
-		refreshToken = EditorGUILayout.TextField("Refresh Token", refreshToken);
+		refreshToken = EditorGUILayout.TextField("Integration Token", refreshToken);
 		EditorGUILayout.Space();
 		EditorGUILayout.LabelField("Repo ID");
 		EditorGUILayout.SelectableLabel(repoId, EditorStyles.textField, GUILayout.Height(18));
