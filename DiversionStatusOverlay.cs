@@ -27,16 +27,113 @@ public static class DiversionStatusOverlay
 	public const string DiversionDebugLogsKey = "DiversionOverlay.DebugLogs";
 	public const string DiversionMeldPathKey = "DiversionOverlay.MeldPath";
 	public const string DiversionBranchRefKey = "DiversionOverlay.BranchRef";
+	public const string DiversionAutoRefreshEnabledKey = "DiversionOverlay.AutoRefreshEnabled";
+	public const string DiversionAutoRefreshIntervalKey = "DiversionOverlay.AutoRefreshInterval";
+	public const string DiversionDiffToolNameKey = "DiversionOverlay.DiffToolName";
+	public const string DiversionDiffToolPathKey = "DiversionOverlay.DiffToolPath";
 	private const double AccessTokenRefreshIntervalSeconds = 59 * 60; // 59 minutes
 
 	private static bool pendingRefresh = false;
 	private static double lastAssetChangeTime = 0;
 	private static float refreshDelay = 1.0f; // default 1 second
 	private static int maxFilesSetting;
+	private static double lastAutoRefreshTime = 0;
 
 	// Helper to get a project-specific key for EditorPrefs
 	public static string ProjectKeyPrefix => Application.dataPath.GetHashCode().ToString();
 	public static string ProjectScopedKey(string baseKey) => $"DiversionOverlay.{ProjectKeyPrefix}.{baseKey}";
+
+	// Supported diff tools and their info
+	public class DiffToolInfo {
+		public string Name;
+		public string[] PossiblePaths;
+		public string ArgumentsFormat; // e.g. "\"{0}\" \"{1}\""
+		public bool IsAvailable;
+		public DiffToolInfo(string name, string[] paths, string args) {
+			Name = name; PossiblePaths = paths; ArgumentsFormat = args; IsAvailable = false;
+		}
+	}
+
+	public static List<DiversionStatusOverlay.DiffToolInfo> GetPlatformDiffTools() {
+		#if UNITY_EDITOR_WIN
+			return new List<DiversionStatusOverlay.DiffToolInfo> {
+				new DiversionStatusOverlay.DiffToolInfo("Meld", new[]{
+					System.Environment.GetFolderPath(System.Environment.SpecialFolder.ProgramFiles) + @"\Meld\Meld.exe",
+					System.Environment.GetFolderPath(System.Environment.SpecialFolder.ProgramFilesX86) + @"\Meld\Meld.exe"
+				}, "\"{0}\" \"{1}\""),
+				new DiversionStatusOverlay.DiffToolInfo("Beyond Compare", new[]{
+					System.Environment.GetFolderPath(System.Environment.SpecialFolder.ProgramFiles) + @"\Beyond Compare 4\BCompare.exe",
+					System.Environment.GetFolderPath(System.Environment.SpecialFolder.ProgramFilesX86) + @"\Beyond Compare 4\BCompare.exe"
+				}, "\"{0}\" \"{1}\""),
+				new DiversionStatusOverlay.DiffToolInfo("WinMerge", new[]{
+					System.Environment.GetFolderPath(System.Environment.SpecialFolder.ProgramFiles) + @"\WinMerge\WinMergeU.exe",
+					System.Environment.GetFolderPath(System.Environment.SpecialFolder.ProgramFilesX86) + @"\WinMerge\WinMergeU.exe"
+				}, "/e /u \"{0}\" \"{1}\""),
+				new DiversionStatusOverlay.DiffToolInfo("KDiff3", new[]{
+					System.Environment.GetFolderPath(System.Environment.SpecialFolder.ProgramFiles) + @"\KDiff3\kdiff3.exe",
+					System.Environment.GetFolderPath(System.Environment.SpecialFolder.ProgramFilesX86) + @"\KDiff3\kdiff3.exe"
+				}, "\"{0}\" \"{1}\""),
+				new DiversionStatusOverlay.DiffToolInfo("Araxis Merge", new[]{
+					System.Environment.GetFolderPath(System.Environment.SpecialFolder.ProgramFiles) + @"\Araxis\Araxis Merge\Merge.exe"
+				}, "\"{0}\" \"{1}\""),
+			};
+		#elif UNITY_EDITOR_OSX
+			return new List<DiversionStatusOverlay.DiffToolInfo> {
+				new DiversionStatusOverlay.DiffToolInfo("Meld", new[]{
+					"/Applications/Meld.app/Contents/MacOS/Meld",
+					"/usr/local/bin/meld"
+				}, "\"{0}\" \"{1}\""),
+				new DiversionStatusOverlay.DiffToolInfo("Beyond Compare", new[]{
+					"/Applications/Beyond Compare.app/Contents/MacOS/bcomp"
+				}, "\"{0}\" \"{1}\""),
+				new DiversionStatusOverlay.DiffToolInfo("Kaleidoscope", new[]{
+					"/Applications/Kaleidoscope.app/Contents/Resources/bin/ksdiff"
+				}, "\"{0}\" \"{1}\""),
+				new DiversionStatusOverlay.DiffToolInfo("FileMerge (opendiff)", new[]{
+					"/usr/bin/opendiff"
+				}, "\"{0}\" \"{1}\""),
+				new DiversionStatusOverlay.DiffToolInfo("DiffMerge", new[]{
+					"/Applications/DiffMerge.app/Contents/MacOS/DiffMerge"
+				}, "\"{0}\" \"{1}\""),
+			};
+		#else // Linux
+			return new List<DiversionStatusOverlay.DiffToolInfo> {
+				new DiversionStatusOverlay.DiffToolInfo("Meld", new[]{
+					"/usr/bin/meld",
+					"/usr/local/bin/meld"
+				}, "\"{0}\" \"{1}\""),
+				new DiversionStatusOverlay.DiffToolInfo("KDiff3", new[]{
+					"/usr/bin/kdiff3",
+					"/usr/local/bin/kdiff3"
+				}, "\"{0}\" \"{1}\""),
+				new DiversionStatusOverlay.DiffToolInfo("Kompare", new[]{
+					"/usr/bin/kompare"
+				}, "\"{0}\" \"{1}\""),
+				new DiversionStatusOverlay.DiffToolInfo("DiffMerge", new[]{
+					"/usr/bin/diffmerge",
+					"/usr/local/bin/diffmerge"
+				}, "\"{0}\" \"{1}\""),
+			};
+		#endif
+	}
+
+	public static void AutoDetectDiffTools(List<DiversionStatusOverlay.DiffToolInfo> tools) {
+		foreach (var tool in tools) {
+			foreach (var path in tool.PossiblePaths) {
+				if (!string.IsNullOrEmpty(path) && System.IO.File.Exists(path)) {
+					tool.IsAvailable = true;
+					break;
+				}
+			}
+		}
+	}
+
+	public static DiversionStatusOverlay.DiffToolInfo GetSelectedDiffTool(List<DiversionStatusOverlay.DiffToolInfo> tools, string selectedName) {
+		foreach (var tool in tools) {
+			if (tool.Name == selectedName) return tool;
+		}
+		return null;
+	}
 
 	static DiversionStatusOverlay()
 	{
@@ -50,6 +147,7 @@ public static class DiversionStatusOverlay
 		CheckAndRefreshAccessTokenIfNeeded();
 		// Refresh status when Unity regains focus
 		EditorApplication.focusChanged += OnEditorFocusChanged;
+		lastAutoRefreshTime = EditorApplication.timeSinceStartup;
 	}
 
 	static void LoadIcons()
@@ -685,6 +783,15 @@ public static class DiversionStatusOverlay
 			pendingRefresh = false;
 			UpdateStatusAsync();
 		}
+		// Auto refresh logic
+		bool autoRefreshEnabled = EditorPrefs.GetBool(ProjectScopedKey(DiversionStatusOverlay.DiversionAutoRefreshEnabledKey), false);
+		float minAutoRefresh = 5f;
+		float autoRefreshInterval = EditorPrefs.GetFloat(ProjectScopedKey(DiversionStatusOverlay.DiversionAutoRefreshIntervalKey), minAutoRefresh);
+		if (autoRefreshEnabled && (EditorApplication.timeSinceStartup - lastAutoRefreshTime > autoRefreshInterval))
+		{
+			lastAutoRefreshTime = EditorApplication.timeSinceStartup;
+			UpdateStatusAsync();
+		}
 		// Check if access token needs to be refreshed
 		CheckAndRefreshAccessTokenIfNeeded();
 	}
@@ -747,8 +854,8 @@ public static class DiversionStatusOverlay
 
 	public static bool DebugLogsEnabled => EditorPrefs.GetBool(ProjectScopedKey(DiversionStatusOverlay.DiversionDebugLogsKey), false);
 
-	[MenuItem("Assets/Diversion/Compare with Tracked in Meld", true, 2100)]
-	private static bool ValidateCompareWithTrackedInMeld()
+	[MenuItem("Assets/Diversion/Compare in Diff Tool with Commit", true, 2100)]
+	private static bool ValidateCompareInDiffToolWithCommit()
 	{
 		var selected = Selection.activeObject;
 		if (selected == null) return false;
@@ -864,8 +971,8 @@ public static class DiversionStatusOverlay
 		return selected;
 	}
 
-	[MenuItem("Assets/Diversion/Compare with Tracked in Meld", false, 2100)]
-	public static async void CompareWithTrackedInMeld()
+	[MenuItem("Assets/Diversion/Compare in Diff Tool with Commit", false, 2100)]
+	public static async void CompareInDiffToolWithCommit()
 	{
 		var selected = Selection.activeObject;
 		if (selected == null) return;
@@ -905,18 +1012,15 @@ public static class DiversionStatusOverlay
 			return;
 		}
 
-		string meldPath = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionMeldPathKey), "/Applications/Meld.app/Contents/MacOS/Meld");
-		if (!System.IO.File.Exists(meldPath))
+		string diffToolName = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionDiffToolNameKey), "Meld");
+		string diffToolPath = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionDiffToolPathKey), "");
+		if (string.IsNullOrEmpty(diffToolPath) || !System.IO.File.Exists(diffToolPath))
 		{
-			EditorUtility.DisplayDialog("Meld Not Found", $"Meld was not found at: {meldPath}\nPlease set the correct path in Diversion Project Settings.", "OK");
+			EditorUtility.DisplayDialog("Diff Tool Not Found", $"Diff tool was not found at: {diffToolPath}\nPlease set the correct path in Diversion Project Settings.", "OK");
 			return;
 		}
-
-		if (AssetDatabase.IsValidFolder(path))
-		{
-			EditorUtility.DisplayDialog("Not Supported", "Folder diff is not supported yet with the Diversion API integration.", "OK");
-			return;
-		}
+		var toolInfo = GetPlatformDiffTools().FirstOrDefault(t => t.Name == diffToolName);
+		string argFormat = toolInfo != null ? toolInfo.ArgumentsFormat : "\"{0}\" \"{1}\"";
 
 		// Find repo root and get relative path
 		string repoRoot = FindRepoRoot(path);
@@ -940,14 +1044,14 @@ public static class DiversionStatusOverlay
 		}
 
 		// Launch Meld
-		var meldPsi = new System.Diagnostics.ProcessStartInfo
+		var diffPsi = new System.Diagnostics.ProcessStartInfo
 		{
-			FileName = meldPath,
-			Arguments = $"\"{System.IO.Path.GetFullPath(path)}\" \"{tempPath}\"",
+			FileName = diffToolPath,
+			Arguments = string.Format(argFormat, System.IO.Path.GetFullPath(path), tempPath),
 			UseShellExecute = false,
 			CreateNoWindow = true
 		};
-		System.Diagnostics.Process.Start(meldPsi);
+		System.Diagnostics.Process.Start(diffPsi);
 
 		if (DebugLogsEnabled)
 		{
@@ -1200,6 +1304,11 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 	private string cliPath;
 	private float refreshIntervalSetting;
 	private int maxFilesSetting;
+	private bool autoRefreshEnabled;
+	private float autoRefreshInterval;
+	private List<DiversionStatusOverlay.DiffToolInfo> diffTools;
+	private string selectedDiffToolName;
+	private string selectedDiffToolPath;
 
 	public DiversionOverlaySettingsProvider(string path, SettingsScope scope = SettingsScope.Project)
 		: base(path, scope) { }
@@ -1232,6 +1341,13 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 		if (!string.IsNullOrEmpty(cliPath))
 			EditorPrefs.SetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionCLIPathKey), cliPath);
 		maxFilesSetting = EditorPrefs.GetInt(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionMaxFilesKey), 1000);
+		autoRefreshEnabled = EditorPrefs.GetBool(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionAutoRefreshEnabledKey), false);
+		float minAutoRefresh = 5f;
+		autoRefreshInterval = EditorPrefs.GetFloat(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionAutoRefreshIntervalKey), minAutoRefresh);
+		diffTools = DiversionStatusOverlay.GetPlatformDiffTools();
+		DiversionStatusOverlay.AutoDetectDiffTools(diffTools);
+		selectedDiffToolName = EditorPrefs.GetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionDiffToolNameKey), diffTools.FirstOrDefault(t => t.IsAvailable)?.Name ?? "Meld");
+		selectedDiffToolPath = EditorPrefs.GetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionDiffToolPathKey), "");
 	}
 
 	public override void OnGUI(string searchContext)
@@ -1290,6 +1406,7 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 		}
 
 		EditorGUILayout.Space();
+		// Sliders group
 		EditorGUILayout.LabelField("Status Refresh Delay After Change (seconds)");
 		EditorGUI.BeginChangeCheck();
 		float delaySetting = EditorPrefs.GetFloat(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionRefreshDelayKey), 1.0f);
@@ -1299,7 +1416,6 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 			EditorPrefs.SetFloat(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionRefreshDelayKey), delaySetting);
 		}
 
-		EditorGUILayout.Space();
 		EditorGUILayout.LabelField("Max Files to Check per API Call");
 		EditorGUI.BeginChangeCheck();
 		maxFilesSetting = EditorGUILayout.IntSlider(maxFilesSetting, 100, 5000);
@@ -1309,6 +1425,34 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 		}
 
 		EditorGUILayout.Space();
+		// Auto Refresh Option (moved here)
+		EditorGUILayout.LabelField("Auto Refresh Status Icons", EditorStyles.boldLabel);
+		EditorGUILayout.BeginHorizontal();
+		bool newAutoRefreshEnabled = EditorGUILayout.ToggleLeft("Enable Auto Refresh", autoRefreshEnabled, GUILayout.Width(160));
+		if (newAutoRefreshEnabled)
+		{
+			Texture2D refreshIcon = EditorGUIUtility.FindTexture("d_Refresh");
+			if (refreshIcon != null)
+			{
+				GUILayout.Label(refreshIcon, GUILayout.Width(20), GUILayout.Height(20));
+			}
+		}
+		EditorGUILayout.EndHorizontal();
+		float minAutoRefresh = 5f;
+		float newAutoRefreshInterval = EditorGUILayout.Slider("Interval (seconds)", autoRefreshInterval, minAutoRefresh, 60f);
+		if (newAutoRefreshEnabled != autoRefreshEnabled)
+		{
+			EditorPrefs.SetBool(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionAutoRefreshEnabledKey), newAutoRefreshEnabled);
+			autoRefreshEnabled = newAutoRefreshEnabled;
+		}
+		if (Mathf.Abs(newAutoRefreshInterval - autoRefreshInterval) > 0.01f)
+		{
+			EditorPrefs.SetFloat(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionAutoRefreshIntervalKey), newAutoRefreshInterval);
+			autoRefreshInterval = newAutoRefreshInterval;
+		}
+		EditorGUILayout.Space();
+
+		// Restore the following sections:
 		EditorGUILayout.LabelField("Status Icon Legend", EditorStyles.boldLabel);
 		var legend = new (string label, string key)[] {
 			("Added", "added"),
@@ -1352,12 +1496,45 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 		}
 
 		EditorGUILayout.Space();
-		EditorGUILayout.LabelField("Meld Diff Tool Path");
-		string meldPathSetting = EditorPrefs.GetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionMeldPathKey), "/Applications/Meld.app/Contents/MacOS/Meld");
-		string newMeldPath = EditorGUILayout.TextField(meldPathSetting);
-		if (newMeldPath != meldPathSetting)
+		EditorGUILayout.LabelField("Diff Tool");
+		var availableToolNames = diffTools.Where(t => t.IsAvailable).Select(t => t.Name).ToList();
+		availableToolNames.Add("Custom");
+		int selectedIndex = Mathf.Max(0, availableToolNames.IndexOf(selectedDiffToolName));
+		string[] toolNamesArray = availableToolNames.ToArray();
+		int newSelectedIndex = EditorGUILayout.Popup("Select Diff Tool", selectedIndex, toolNamesArray);
+		string newSelectedName = toolNamesArray[newSelectedIndex];
+		if (newSelectedName != selectedDiffToolName)
 		{
-			EditorPrefs.SetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionMeldPathKey), newMeldPath);
+			selectedDiffToolName = newSelectedName;
+			EditorPrefs.SetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionDiffToolNameKey), selectedDiffToolName);
+			// If not custom, auto-fill path
+			if (selectedDiffToolName != "Custom")
+			{
+				var tool = diffTools.FirstOrDefault(t => t.Name == selectedDiffToolName);
+				if (tool != null)
+				{
+					string foundPath = tool.PossiblePaths.FirstOrDefault(p => System.IO.File.Exists(p));
+					if (!string.IsNullOrEmpty(foundPath))
+					{
+						selectedDiffToolPath = foundPath;
+						EditorPrefs.SetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionDiffToolPathKey), selectedDiffToolPath);
+					}
+				}
+			}
+		}
+		string newDiffToolPath = selectedDiffToolPath;
+		if (selectedDiffToolName == "Custom")
+		{
+			newDiffToolPath = EditorGUILayout.TextField("Diff Tool Path", selectedDiffToolPath);
+		}
+		else
+		{
+			EditorGUILayout.LabelField("Diff Tool Path", selectedDiffToolPath);
+		}
+		if (newDiffToolPath != selectedDiffToolPath)
+		{
+			selectedDiffToolPath = newDiffToolPath;
+			EditorPrefs.SetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionDiffToolPathKey), selectedDiffToolPath);
 		}
 
 		GUILayout.EndVertical();
