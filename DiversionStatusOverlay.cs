@@ -3,7 +3,7 @@ using UnityEditor;
 using System.Collections.Generic;
 using System.Threading.Tasks;
 using UnityEngine.Networking;
-using Newtonsoft.Json.Linq;
+using System.Text.Json;
 using System.Linq;
 #if UNITY_EDITOR
 using UnityEngine.UIElements;
@@ -143,7 +143,13 @@ public static class DiversionStatusOverlay
 		UpdateStatusAsync();
 		refreshDelay = EditorPrefs.GetFloat(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionRefreshDelayKey), 1.0f);
 		maxFilesSetting = EditorPrefs.GetInt(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionMaxFilesKey), 1000);
-		// On startup, if token is old, refresh it
+		// On startup, refresh access token immediately if refresh token is present
+		string refreshToken = EditorPrefs.GetString(ProjectScopedKey(DiversionStatusOverlay.DiversionRefreshTokenKey), "");
+		if (!string.IsNullOrEmpty(refreshToken))
+		{
+			_ = ExchangeRefreshTokenForAccessToken(refreshToken);
+		}
+		// Also check if token is old and needs refresh
 		CheckAndRefreshAccessTokenIfNeeded();
 		// Refresh status when Unity regains focus
 		EditorApplication.focusChanged += OnEditorFocusChanged;
@@ -185,8 +191,9 @@ public static class DiversionStatusOverlay
 			}
 			try
 			{
-				var json = JObject.Parse(www.downloadHandler.text);
-				string accessToken = json["access_token"]?.Value<string>();
+				using var jsonDoc = JsonDocument.Parse(www.downloadHandler.text);
+				var root = jsonDoc.RootElement;
+				string accessToken = root.TryGetProperty("access_token", out var at) ? at.GetString() : null;
 				if (!string.IsNullOrEmpty(accessToken) && accessToken.Count(c => c == '.') == 2)
 				{
 					EditorPrefs.SetString(ProjectScopedKey(DiversionStatusOverlay.DiversionAccessTokenKey), accessToken);
@@ -195,7 +202,7 @@ public static class DiversionStatusOverlay
 				}
 				else
 				{
-					Debug.LogError($"Diversion Overlay: No valid access_token in response. Raw: {json["access_token"]}");
+					Debug.LogError($"Diversion Overlay: No valid access_token in response. Raw: {root.GetRawText()}");
 				}
 			}
 			catch (System.Exception ex)
@@ -226,9 +233,9 @@ public static class DiversionStatusOverlay
 		int limit = EditorPrefs.GetInt(ProjectScopedKey(DiversionStatusOverlay.DiversionMaxFilesKey), 1000);
 		int skip = 0;
 		bool more = true;
-		JObject combinedItems = new JObject();
+		var combinedItems = new Dictionary<string, List<Dictionary<string, object>>>();
 		string[] categories = new[] { "new", "modified", "deleted", "conflicted", "moved" };
-		foreach (var cat in categories) combinedItems[cat] = new JArray();
+		foreach (var cat in categories) combinedItems[cat] = new List<Dictionary<string, object>>();
 
 		while (more)
 		{
@@ -245,18 +252,24 @@ public static class DiversionStatusOverlay
 					return;
 				}
 
-				JObject json = JObject.Parse(webRequest.downloadHandler.text);
-				var items = json["items"] as JObject;
-				if (items != null)
+				using var jsonDoc = JsonDocument.Parse(webRequest.downloadHandler.text);
+				var root = jsonDoc.RootElement;
+				if (root.TryGetProperty("items", out var items))
 				{
 					int itemsAddedThisPage = 0;
 					foreach (var cat in categories)
 					{
-						var arr = items[cat] as JArray;
-						if (arr != null && arr.Count > 0)
+						if (items.TryGetProperty(cat, out var arr) && arr.ValueKind == JsonValueKind.Array && arr.GetArrayLength() > 0)
 						{
-							((JArray)combinedItems[cat]).Merge(arr);
-							itemsAddedThisPage += arr.Count;
+							foreach (var item in arr.EnumerateArray())
+							{
+								var dict = new Dictionary<string, object>();
+								if (item.TryGetProperty("path", out var pathProp)) dict["path"] = pathProp.GetString();
+								if (item.TryGetProperty("prev_path", out var prevPathProp)) dict["prev_path"] = prevPathProp.GetString();
+								// Add more properties as needed
+								combinedItems[cat].Add(dict);
+								itemsAddedThisPage++;
+							}
 						}
 					}
 					if (itemsAddedThisPage < limit)
@@ -276,8 +289,8 @@ public static class DiversionStatusOverlay
 		}
 
 		// Build a fake status JSON to pass to ParseDiversionAPIOutput
-		JObject fakeStatusJson = new JObject { ["items"] = combinedItems };
-		ParseDiversionAPIOutput(fakeStatusJson.ToString());
+		var fakeStatus = new Dictionary<string, object> { ["items"] = combinedItems };
+		ParseDiversionAPIOutput(JsonSerializer.Serialize(fakeStatus));
 		EditorApplication.RepaintProjectWindow();
 	}
 
@@ -285,51 +298,62 @@ public static class DiversionStatusOverlay
 	{
 		fileStatus.Clear();
 		folderStatus.Clear();
-		JObject json = JObject.Parse(jsonOutput);
+		using var jsonDoc = JsonDocument.Parse(jsonOutput);
+		var root = jsonDoc.RootElement;
+		var items = root.GetProperty("items");
 		// New
-		foreach (var item in json["items"]?["new"]?.OfType<JObject>() ?? Enumerable.Empty<JObject>())
+		if (items.TryGetProperty("new", out var newArr) && newArr.ValueKind == JsonValueKind.Array)
 		{
-			string path = item["path"]?.Value<string>();
-			if (!string.IsNullOrEmpty(path) && path.StartsWith("Assets"))
+			foreach (var item in newArr.EnumerateArray())
 			{
-				fileStatus[path] = "added";
-				if (path.EndsWith(".meta"))
+				string path = item.TryGetProperty("path", out var p) ? p.GetString() : null;
+				if (!string.IsNullOrEmpty(path) && path.StartsWith("Assets"))
 				{
-					string assetPath = path.Substring(0, path.Length - 5);
-					if (!fileStatus.ContainsKey(assetPath))
-						fileStatus[assetPath] = "added";
+					fileStatus[path] = "added";
+					if (path.EndsWith(".meta"))
+					{
+						string assetPath = path.Substring(0, path.Length - 5);
+						if (!fileStatus.ContainsKey(assetPath))
+							fileStatus[assetPath] = "added";
+					}
 				}
 			}
 		}
 		// Modified
-		foreach (var item in json["items"]?["modified"]?.OfType<JObject>() ?? Enumerable.Empty<JObject>())
+		if (items.TryGetProperty("modified", out var modArr) && modArr.ValueKind == JsonValueKind.Array)
 		{
-			string path = item["path"]?.Value<string>();
-			string prevPath = item["prev_path"]?.Value<string>();
-			string status = (!string.IsNullOrEmpty(prevPath) && prevPath != path) ? "moved" : "modified";
-			if (!string.IsNullOrEmpty(path) && path.StartsWith("Assets"))
+			foreach (var item in modArr.EnumerateArray())
 			{
-				fileStatus[path] = status;
-				if (path.EndsWith(".meta"))
+				string path = item.TryGetProperty("path", out var p) ? p.GetString() : null;
+				string prevPath = item.TryGetProperty("prev_path", out var prev) ? prev.GetString() : null;
+				string status = (!string.IsNullOrEmpty(prevPath) && prevPath != path) ? "moved" : "modified";
+				if (!string.IsNullOrEmpty(path) && path.StartsWith("Assets"))
 				{
-					string assetPath = path.Substring(0, path.Length - 5);
-					if (!fileStatus.ContainsKey(assetPath))
-						fileStatus[assetPath] = status;
+					fileStatus[path] = status;
+					if (path.EndsWith(".meta"))
+					{
+						string assetPath = path.Substring(0, path.Length - 5);
+						if (!fileStatus.ContainsKey(assetPath))
+							fileStatus[assetPath] = status;
+					}
 				}
 			}
 		}
 		// Deleted
-		foreach (var item in json["items"]?["deleted"]?.OfType<JObject>() ?? Enumerable.Empty<JObject>())
+		if (items.TryGetProperty("deleted", out var delArr) && delArr.ValueKind == JsonValueKind.Array)
 		{
-			string path = item["path"]?.Value<string>();
-			if (!string.IsNullOrEmpty(path) && path.StartsWith("Assets"))
+			foreach (var item in delArr.EnumerateArray())
 			{
-				fileStatus[path] = "deleted";
-				if (path.EndsWith(".meta"))
+				string path = item.TryGetProperty("path", out var p) ? p.GetString() : null;
+				if (!string.IsNullOrEmpty(path) && path.StartsWith("Assets"))
 				{
-					string assetPath = path.Substring(0, path.Length - 5);
-					if (!fileStatus.ContainsKey(assetPath))
-						fileStatus[assetPath] = "deleted";
+					fileStatus[path] = "deleted";
+					if (path.EndsWith(".meta"))
+					{
+						string assetPath = path.Substring(0, path.Length - 5);
+						if (!fileStatus.ContainsKey(assetPath))
+							fileStatus[assetPath] = "deleted";
+					}
 				}
 			}
 		}
@@ -419,64 +443,79 @@ public static class DiversionStatusOverlay
 			if (DiversionStatusOverlay.DebugLogsEnabled) Debug.LogWarning("Diversion Overlay: Could not find Diversion CLI (dv). Please set the path in Project Settings.");
 			return;
 		}
-		var psi = new System.Diagnostics.ProcessStartInfo
-		{
-			FileName = diversionCLIPath,
-			Arguments = "status --porcelain",
-			RedirectStandardOutput = true,
-			RedirectStandardError = true,
-			UseShellExecute = false,
-			CreateNoWindow = true
-		};
-		try
-		{
-			using (var process = System.Diagnostics.Process.Start(psi))
+		System.Threading.Tasks.Task.Run(() => {
+			var psi = new System.Diagnostics.ProcessStartInfo
 			{
-				string output = process.StandardOutput.ReadToEnd();
-				process.WaitForExit();
-				string repoId = null;
-				string workspaceId = null;
-				using (var reader = new System.IO.StringReader(output))
+				FileName = diversionCLIPath,
+				Arguments = "status --porcelain",
+				RedirectStandardOutput = true,
+				RedirectStandardError = true,
+				UseShellExecute = false,
+				CreateNoWindow = true
+			};
+			try
+			{
+				using (var process = System.Diagnostics.Process.Start(psi))
 				{
-					string line;
-					while ((line = reader.ReadLine()) != null)
+					if (!process.WaitForExit(2000)) // 2 second timeout
 					{
-						if (line.Contains("dv.repo."))
+						process.Kill();
+						EditorApplication.delayCall += () => {
+							EditorUtility.DisplayDialog("Diversion CLI Timeout", "Auto-detecting IDs from CLI timed out. Please check your Diversion CLI installation and try again.\n\nYou can also enter the Repo ID and Workspace ID manually in the Diversion settings.", "OK");
+						};
+						return;
+					}
+					string output = process.StandardOutput.ReadToEnd();
+					string repoId = null;
+					string workspaceId = null;
+					using (var reader = new System.IO.StringReader(output))
+					{
+						string line;
+						while ((line = reader.ReadLine()) != null)
 						{
-							int idx = line.IndexOf("dv.repo.");
-							if (idx != -1)
-								repoId = line.Substring(idx + "dv.repo.".Length).Trim();
-						}
-						if (line.Contains("dv.ws."))
-						{
-							int idx = line.IndexOf("dv.ws.");
-							if (idx != -1)
+							if (line.Contains("dv.repo."))
 							{
-								workspaceId = line.Substring(idx + "dv.ws.".Length);
-								int end = workspaceId.IndexOf(')');
-								if (end != -1)
-									workspaceId = workspaceId.Substring(0, end);
-								workspaceId = workspaceId.Trim();
+								int idx = line.IndexOf("dv.repo.");
+								if (idx != -1)
+									repoId = line.Substring(idx + "dv.repo.".Length).Trim();
+							}
+							if (line.Contains("dv.ws."))
+							{
+								int idx = line.IndexOf("dv.ws.");
+								if (idx != -1)
+								{
+									workspaceId = line.Substring(idx + "dv.ws.".Length);
+									int end = workspaceId.IndexOf(')');
+									if (end != -1)
+										workspaceId = workspaceId.Substring(0, end);
+									workspaceId = workspaceId.Trim();
+								}
 							}
 						}
 					}
-				}
-				if (!string.IsNullOrEmpty(repoId) && !string.IsNullOrEmpty(workspaceId))
-				{
-					EditorPrefs.SetString(ProjectScopedKey(DiversionStatusOverlay.DiversionRepoIdKey), repoId);
-					EditorPrefs.SetString(ProjectScopedKey(DiversionStatusOverlay.DiversionWorkspaceIdKey), workspaceId);
-					if (DiversionStatusOverlay.DebugLogsEnabled) Debug.Log($"Diversion Overlay: Auto-fetched Repo ID: {repoId}, Workspace ID: {workspaceId}");
-				}
-				else
-				{
-					if (DiversionStatusOverlay.DebugLogsEnabled) Debug.LogWarning("Diversion Overlay: Could not auto-detect Repo ID or Workspace ID.");
+					if (!string.IsNullOrEmpty(repoId) && !string.IsNullOrEmpty(workspaceId))
+					{
+						EditorApplication.delayCall += () => {
+							EditorPrefs.SetString(ProjectScopedKey(DiversionStatusOverlay.DiversionRepoIdKey), repoId);
+							EditorPrefs.SetString(ProjectScopedKey(DiversionStatusOverlay.DiversionWorkspaceIdKey), workspaceId);
+							if (DiversionStatusOverlay.DebugLogsEnabled) Debug.Log($"Diversion Overlay: Auto-fetched Repo ID: {repoId}, Workspace ID: {workspaceId}");
+						};
+					}
+					else
+					{
+						EditorApplication.delayCall += () => {
+							if (DiversionStatusOverlay.DebugLogsEnabled) Debug.LogWarning("Diversion Overlay: Could not auto-detect Repo ID or Workspace ID.");
+						};
+					}
 				}
 			}
-		}
-		catch (System.Exception ex)
-		{
-			Debug.LogError("Diversion Overlay: Error fetching repo/workspace IDs: " + ex.Message);
-		}
+			catch (System.Exception ex)
+			{
+				EditorApplication.delayCall += () => {
+					Debug.LogError("Diversion Overlay: Error fetching repo/workspace IDs: " + ex.Message);
+				};
+			}
+		});
 	}
 
 	public static string AutoDetectDiversionCLIPath()
@@ -628,16 +667,15 @@ public static class DiversionStatusOverlay
 		List<string> newFiles = new List<string>();
 		if (statusRequest.result == UnityWebRequest.Result.Success)
 		{
-			var json = JObject.Parse(statusRequest.downloadHandler.text);
-			var items = json["items"] as JObject;
-			if (items != null)
+			using var jsonDoc = JsonDocument.Parse(statusRequest.downloadHandler.text);
+			var root = jsonDoc.RootElement;
+			if (root.TryGetProperty("items", out var items))
 			{
-				var arr = items["new"] as JArray;
-				if (arr != null)
+				if (items.TryGetProperty("new", out var arr) && arr.ValueKind == JsonValueKind.Array)
 				{
-					foreach (var entry in arr.OfType<JObject>())
+					foreach (var entry in arr.EnumerateArray())
 					{
-						string path = entry["path"]?.ToString();
+						string path = entry.TryGetProperty("path", out var p) ? p.GetString() : null;
 						if (string.IsNullOrEmpty(path)) continue;
 						// If the new file is directly selected or under a selected folder
 						bool isUnderSelected = false;
@@ -716,14 +754,14 @@ public static class DiversionStatusOverlay
 
 		// Prepare API call
 		string apiUrl = $"https://api.diversion.dev/v0/repos/{repoId}/workspaces/{workspaceId}/reset";
-		JObject payload;
+		var payload = new Dictionary<string, object>();
 		if (canUseTheAll)
 		{
-			payload = new JObject { ["theall"] = true };
+			payload["theall"] = true;
 		}
 		else
 		{
-			payload = new JObject { ["paths"] = new JArray(selectedPaths) };
+			payload["paths"] = selectedPaths.ToList();
 		}
 		if (deleteNewFiles)
 		{
@@ -731,7 +769,7 @@ public static class DiversionStatusOverlay
 		}
 		using (UnityWebRequest webRequest = new UnityWebRequest(apiUrl, "POST"))
 		{
-			string json = payload.ToString();
+			string json = System.Text.Json.JsonSerializer.Serialize(payload);
 			byte[] bodyRaw = System.Text.Encoding.UTF8.GetBytes(json);
 			webRequest.uploadHandler = new UploadHandlerRaw(bodyRaw);
 			webRequest.downloadHandler = new DownloadHandlerBuffer();
@@ -912,19 +950,20 @@ public static class DiversionStatusOverlay
 			await req.SendWebRequest();
 			if (req.result == UnityWebRequest.Result.Success)
 			{
-				var json = JObject.Parse(req.downloadHandler.text);
-				if (DebugLogsEnabled) Debug.Log($"Diversion Overlay: Workspace config JSON: {json}");
-				if (DebugLogsEnabled && json != null)
+				using var jsonDoc = JsonDocument.Parse(req.downloadHandler.text);
+				var root = jsonDoc.RootElement;
+				if (DebugLogsEnabled) Debug.Log($"Diversion Overlay: Workspace config JSON: {root.GetRawText()}");
+				if (DebugLogsEnabled && root.ValueKind != JsonValueKind.Object)
 				{
-					Debug.Log("Diversion Overlay: Workspace config JSON keys: " + string.Join(", ", json.Properties().Select(p => p.Name)));
+					Debug.Log("Diversion Overlay: Workspace config JSON keys: " + string.Join(", ", root.EnumerateObject().Select(p => p.Name)));
 				}
-				if (json != null && json.HasValues)
+				if (root.ValueKind == JsonValueKind.Object)
 				{
-					string repoId = json["repo_id"]?.ToString() ?? json["RepoID"]?.ToString();
-					string workspaceId = json["workspace_id"]?.ToString() ?? json["WorkspaceID"]?.ToString();
-					string branchId = json["branch_id"]?.ToString() ?? json["BranchID"]?.ToString();
-					string branch = json["branch"]?.ToString() ?? json["BranchName"]?.ToString();
-					string refField = json["ref"]?.ToString() ?? json["CommitID"]?.ToString();
+					string repoId = root.TryGetProperty("repo_id", out var repoIdProp) ? repoIdProp.GetString() : (root.TryGetProperty("RepoID", out var repoIdProp2) ? repoIdProp2.GetString() : null);
+					string workspaceId = root.TryGetProperty("workspace_id", out var wsIdProp) ? wsIdProp.GetString() : (root.TryGetProperty("WorkspaceID", out var wsIdProp2) ? wsIdProp2.GetString() : null);
+					string branchId = root.TryGetProperty("branch_id", out var branchIdProp) ? branchIdProp.GetString() : (root.TryGetProperty("BranchID", out var branchIdProp2) ? branchIdProp2.GetString() : null);
+					string branch = root.TryGetProperty("branch", out var branchProp) ? branchProp.GetString() : (root.TryGetProperty("BranchName", out var branchProp2) ? branchProp2.GetString() : null);
+					string refField = root.TryGetProperty("ref", out var refProp) ? refProp.GetString() : (root.TryGetProperty("CommitID", out var refProp2) ? refProp2.GetString() : null);
 					if (DebugLogsEnabled)
 					{
 						Debug.Log($"Diversion Overlay: branch_id={branchId}, branch={branch}, ref={refField}");
@@ -956,12 +995,16 @@ public static class DiversionStatusOverlay
 			await req.SendWebRequest();
 			if (req.result == UnityWebRequest.Result.Success)
 			{
-				var json = JObject.Parse(req.downloadHandler.text);
-				foreach (var entry in json["entries"] ?? new JArray())
+				using var jsonDoc = JsonDocument.Parse(req.downloadHandler.text);
+				var root = jsonDoc.RootElement;
+				if (root.TryGetProperty("entries", out var entries) && entries.ValueKind == JsonValueKind.Array)
 				{
-					string commitId = entry["commit_id"]?.ToString();
-					string msg = entry["commit_message"]?.ToString();
-					commits.Add((commitId, msg));
+					foreach (var entry in entries.EnumerateArray())
+					{
+						string commitId = entry.TryGetProperty("commit_id", out var commitIdProp) ? commitIdProp.GetString() : null;
+						string msg = entry.TryGetProperty("commit_message", out var msgProp) ? msgProp.GetString() : null;
+						commits.Add((commitId, msg));
+					}
 				}
 			}
 		}
@@ -1351,10 +1394,19 @@ public class DiversionOverlaySettingsProvider : SettingsProvider
 			EditorPrefs.SetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionRefreshTokenKey), refreshToken);
 		}
 		EditorGUILayout.Space();
-		EditorGUILayout.LabelField("Repo ID");
-		EditorGUILayout.SelectableLabel(repoId, EditorStyles.textField, GUILayout.Height(18));
-		EditorGUILayout.LabelField("Workspace ID");
-		EditorGUILayout.SelectableLabel(workspaceId, EditorStyles.textField, GUILayout.Height(18));
+		EditorGUILayout.Space();
+		string newRepoId = EditorGUILayout.TextField("Repo ID", repoId);
+		if (newRepoId != repoId)
+		{
+			repoId = newRepoId;
+			EditorPrefs.SetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionRepoIdKey), repoId);
+		}
+		string newWorkspaceId = EditorGUILayout.TextField("Workspace ID", workspaceId);
+		if (newWorkspaceId != workspaceId)
+		{
+			workspaceId = newWorkspaceId;
+			EditorPrefs.SetString(DiversionStatusOverlay.ProjectScopedKey(DiversionStatusOverlay.DiversionWorkspaceIdKey), workspaceId);
+		}
 
 		EditorGUILayout.Space();
 		if (GUILayout.Button("Auto-detect IDs from CLI"))
